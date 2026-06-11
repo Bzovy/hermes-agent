@@ -246,6 +246,38 @@ def _is_manual_source(source: str) -> bool:
     return normalized == SOURCE_MANUAL or normalized.startswith(f"{SOURCE_MANUAL}:")
 
 
+# Sources that hold a STATIC API key (env var, manual paste, custom config, or
+# a third-party CLI like ``gh``) and are NOT expected to be populated lazily by
+# the calling code.  Entries from these sources with an empty runtime key are
+# broken state and should be skipped by the pool — they can never make a
+# successful call, and selecting them would starve the rotation for everyone
+# behind them in priority order.
+#
+# Sources NOT in this set (e.g. ``device_code``, ``loopback_pkce``,
+# ``claude_code``) are OAuth-style placeholders that are intentionally seeded
+# with empty tokens and are resolved at request time by their own callers
+# (e.g. ``_try_nous``).  Skipping them here would break the lazy-population
+# contract.
+_STATIC_CREDENTIAL_SOURCES = frozenset({
+    SOURCE_MANUAL,                       # "manual" / "manual:..."  (hermes auth add)
+    "env",                               # "env:VAR_NAME"           (e.g. OPENROUTER_API_KEY)
+    "config",                            # "config:provider name"   (custom_providers)
+    "model_config",                      # model_config             (custom endpoint from model config)
+    "gh_cli",                            # gh CLI token             (copilot)
+})
+
+
+def _is_static_credential_source(source: str) -> bool:
+    normalized = (source or "").strip().lower()
+    if not normalized:
+        return False
+    if normalized in _STATIC_CREDENTIAL_SOURCES:
+        return True
+    if normalized.startswith("env:") or normalized.startswith("config:"):
+        return True
+    return False
+
+
 def _exhausted_ttl(error_code: Optional[int]) -> int:
     """Return cooldown seconds based on the HTTP status that caused exhaustion."""
     if error_code == 401:
@@ -1331,6 +1363,42 @@ class CredentialPool:
                 if refreshed is None:
                     continue
                 entry = refreshed
+            # Skip entries that have no runtime API key — they can never make a
+            # successful call regardless of ``last_status`` (e.g. a manual slot
+            # was created with ``hermes auth add`` but the key was never pasted,
+            # or an env-sourced entry lost its backing env var).  Without this
+            # filter, fill_first would keep returning the empty placeholder and
+            # starve every usable entry behind it in priority order, leaving
+            # auxiliary calls (e.g. ``security_reasoning``) with a false
+            # "missing runtime API key" fallback even though the env key works
+            # fine when called directly.
+            #
+            # We only skip STATIC-key sources here.  OAuth-style placeholders
+            # (``device_code``, ``loopback_pkce``, ``claude_code``) are seeded
+            # with empty tokens and are intentionally returned by ``select()``
+            # so the calling code (e.g. ``_try_nous``) can run its own
+            # token-resolution path against auth.json / a remote IdP.  Skipping
+            # them here would break that contract and leave every Nous /
+            # Codex / Claude-Code caller with a None entry forever.
+            if not entry.runtime_api_key and _is_static_credential_source(entry.source):
+                _label = entry.label or entry.id[:8]
+                if not getattr(self, "_warned_empty_key_entries", None):
+                    self._warned_empty_key_entries = set()
+                if entry.id not in self._warned_empty_key_entries:
+                    self._warned_empty_key_entries.add(entry.id)
+                    logger.warning(
+                        "credential pool: skipping %s entry %r for provider %s — "
+                        "no runtime API key (status=%s, source=%s); re-add via "
+                        "`hermes auth add %s` or restore the backing env var to "
+                        "make this slot usable",
+                        entry.source or "unknown",
+                        _label,
+                        self.provider,
+                        entry.last_status or "ok",
+                        entry.source,
+                        self.provider,
+                    )
+                continue
             available.append(entry)
         if entries_to_prune:
             pruned_ids = set(entries_to_prune)

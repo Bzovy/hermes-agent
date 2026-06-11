@@ -2998,3 +2998,94 @@ def test_codex_oauth_nonterminal_refresh_does_not_quarantine(tmp_path, monkeypat
     tokens = auth_payload["providers"]["openai-codex"].get("tokens", {})
     assert tokens.get("access_token") == "old-access-token"
     assert tokens.get("refresh_token") == "old-refresh-token"
+
+
+def test_fill_first_skips_empty_key_entry_and_selects_env_sourced(tmp_path, monkeypatch):
+    """Regression: a manual entry with empty access_token + last_status=ok
+    used to be selected first by fill_first, blocking the real env-sourced
+    key. The pool must skip entries whose runtime_api_key resolves to "" so
+    the call chain (e.g. security_reasoning) gets a usable credential even
+    when an empty placeholder is at priority 0.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-v1-real-env-key")
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "empty-placeholder",
+                        "label": "Key 1",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "",
+                        "last_status": "ok",
+                        "last_status_at": None,
+                        "last_error_code": None,
+                    },
+                    {
+                        "id": "env-sourced",
+                        "label": "OPENROUTER_API_KEY",
+                        "auth_type": "api_key",
+                        "priority": 1,
+                        "source": "env:OPENROUTER_API_KEY",
+                        "access_token": "sk-or-v1-real-env-key",
+                        "last_status": "ok",
+                        "last_status_at": None,
+                        "last_error_code": None,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    assert pool.has_credentials() is True
+    entry = pool.select()
+
+    assert entry is not None, "pool must skip the empty placeholder and return the env-sourced key"
+    assert entry.id == "env-sourced"
+    assert entry.runtime_api_key == "sk-or-v1-real-env-key"
+    assert pool.has_available() is True
+
+
+def test_pool_with_only_empty_entries_returns_none(tmp_path, monkeypatch):
+    """If the only entry in the pool has no key, has_available() must be
+    False and select() must return None. This is the existing exhausted/
+    empty fallthrough path — the empty-key case now joins it.
+    """
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+    _write_auth_store(
+        tmp_path,
+        {
+            "version": 1,
+            "credential_pool": {
+                "openrouter": [
+                    {
+                        "id": "empty-only",
+                        "label": "Key 1",
+                        "auth_type": "api_key",
+                        "priority": 0,
+                        "source": "manual",
+                        "access_token": "",
+                        "last_status": "ok",
+                        "last_status_at": None,
+                        "last_error_code": None,
+                    },
+                ]
+            },
+        },
+    )
+
+    from agent.credential_pool import load_pool
+
+    pool = load_pool("openrouter")
+    assert pool.has_credentials() is True
+    assert pool.has_available() is False
+    assert pool.select() is None
