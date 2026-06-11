@@ -92,6 +92,8 @@ MAX_REQUEST_BYTES = 10_000_000  # 10 MB — accommodates long agent conversation
 CHAT_COMPLETIONS_SSE_KEEPALIVE_SECONDS = 30.0
 MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
+SECURITY_REASONING_SEVERITIES = {"low", "medium", "high", "critical"}
+SECURITY_REASONING_MODEL_LABEL = "security_reasoning"
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1333,6 +1335,121 @@ class APIServerAdapter(BasePlatformAdapter):
         if not isinstance(body, dict):
             return {}, web.json_response(_openai_error("Request body must be a JSON object"), status=400)
         return body, None
+
+    def _security_reasoning_fallback(self, body: Dict[str, Any], error: Optional[str] = None) -> Dict[str, Any]:
+        fallback_action = body.get("fallback_proposed_action")
+        summary = body.get("summary")
+        result: Dict[str, Any] = {
+            "severity": "medium",
+            "summary": summary.strip() if isinstance(summary, str) and summary.strip() else "Security event detected",
+            "proposed_action": fallback_action.strip()
+            if isinstance(fallback_action, str) and fallback_action.strip()
+            else "Review the security audit evidence and decide whether operator action is needed.",
+            "model": SECURITY_REASONING_MODEL_LABEL,
+            "fallback": True,
+        }
+        if error:
+            result["error"] = error
+        return result
+
+    def _build_security_reasoning_prompt(self, body: Dict[str, Any]) -> str:
+        return "\n".join([
+            "You are the propose-only security reasoning layer for Agentic Master OS.",
+            "Analyze exactly one detected event. Do not suggest taking autonomous action yourself.",
+            "Return ONLY minified JSON with this shape:",
+            '{"severity":"low|medium|high|critical","summary":"plain English what happened and why it matters","proposed_action":"specific suggestion for a human/operator"}',
+            "",
+            "Event evidence:",
+            json.dumps({
+                "source": body.get("source"),
+                "kind": body.get("kind"),
+                "detector_summary": body.get("summary"),
+                "detail": body.get("detail") or {},
+                "fallback_proposed_action": body.get("fallback_proposed_action"),
+            }, separators=(",", ":")),
+        ])
+
+    def _extract_security_reasoning_json(self, content: str) -> Dict[str, Any]:
+        try:
+            parsed = json.loads(content.strip())
+        except json.JSONDecodeError:
+            match = re.search(r"\{[\s\S]*\}", content)
+            if not match:
+                raise ValueError("security reasoning response did not contain JSON")
+            parsed = json.loads(match.group(0))
+        if not isinstance(parsed, dict):
+            raise ValueError("security reasoning response was not a JSON object")
+        return parsed
+
+    def _normalize_security_reasoning(self, raw: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+        severity_raw = raw.get("severity")
+        severity = severity_raw.strip().lower() if isinstance(severity_raw, str) else ""
+        if severity not in SECURITY_REASONING_SEVERITIES:
+            severity = "medium"
+
+        summary_raw = raw.get("summary")
+        request_summary = body.get("summary")
+        summary = summary_raw.strip() if isinstance(summary_raw, str) and summary_raw.strip() else ""
+        if not summary:
+            summary = request_summary.strip() if isinstance(request_summary, str) and request_summary.strip() else "Security event detected"
+
+        action_raw = raw.get("proposed_action")
+        fallback_action = body.get("fallback_proposed_action")
+        proposed_action = action_raw.strip() if isinstance(action_raw, str) and action_raw.strip() else ""
+        if not proposed_action:
+            proposed_action = fallback_action.strip() if isinstance(fallback_action, str) and fallback_action.strip() else "Review the security audit evidence and decide whether operator action is needed."
+
+        return {
+            "severity": severity,
+            "summary": summary,
+            "proposed_action": proposed_action,
+            "model": SECURITY_REASONING_MODEL_LABEL,
+            "fallback": False,
+        }
+
+    async def _handle_security_reasoning(self, request: Any) -> Any:
+        """POST /api/auxiliary/security-reasoning — centralized propose-only security reasoning."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        assert web is not None
+
+        body, error = await self._read_json_body(request)
+        if error:
+            return error
+
+        for field in ("source", "kind", "summary", "fallback_proposed_action"):
+            if not isinstance(body.get(field), str) or not body[field].strip():
+                return web.json_response(_openai_error(f"{field} is required", code="invalid_request"), status=400)
+        detail = body.get("detail")
+        if detail is None:
+            body["detail"] = {}
+        elif not isinstance(detail, dict):
+            return web.json_response(_openai_error("detail must be a JSON object", code="invalid_request"), status=400)
+
+        try:
+            from agent.auxiliary_client import async_call_llm
+
+            response = await async_call_llm(
+                task="security_reasoning",
+                messages=[
+                    {"role": "system", "content": "You return strict JSON only. You are propose-only and never perform actions."},
+                    {"role": "user", "content": self._build_security_reasoning_prompt(body)},
+                ],
+                temperature=0.1,
+                max_tokens=600,
+                timeout=45,
+                extra_body={"response_format": {"type": "json_object"}},
+            )
+            choice = response.choices[0]
+            content = getattr(getattr(choice, "message", None), "content", None)
+            if not content:
+                raise ValueError("security reasoning returned empty content")
+            result = self._normalize_security_reasoning(self._extract_security_reasoning_json(content), body)
+            return web.json_response(result)
+        except Exception as exc:  # noqa: BLE001 - fallback preserves audit logging on provider failures.
+            logger.warning("Security reasoning auxiliary call failed; returning fallback: %s", exc)
+            return web.json_response(self._security_reasoning_fallback(body, str(exc)))
 
     def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
         db = self._ensure_session_db()
@@ -4167,6 +4284,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/capabilities", self._handle_capabilities)
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
+            self._app.router.add_post("/api/auxiliary/security-reasoning", self._handle_security_reasoning)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)

@@ -1303,6 +1303,14 @@ DEFAULT_CONFIG = {
             "timeout": 30,
             "extra_body": {},
         },
+        "security_reasoning": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 45,
+            "extra_body": {"response_format": {"type": "json_object"}},
+        },
         "tts_audio_tags": {
             "provider": "auto",
             "model": "",

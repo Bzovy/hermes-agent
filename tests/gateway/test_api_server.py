@@ -18,6 +18,7 @@ import os
 import stat
 import time
 import uuid
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -414,6 +415,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/capabilities", adapter._handle_capabilities)
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
+    app.router.add_post("/api/auxiliary/security-reasoning", adapter._handle_security_reasoning)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -464,6 +466,99 @@ class TestAgentExecution:
             conversation_history=[],
             task_id="session-123",
         )
+
+
+# ---------------------------------------------------------------------------
+# /api/auxiliary/security-reasoning endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestSecurityReasoningEndpoint:
+    @pytest.mark.asyncio
+    async def test_security_reasoning_normalizes_auxiliary_json(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=json.dumps({
+                "severity": "HIGH",
+                "summary": "Harness exceeded its safe turn budget.",
+                "proposed_action": "Pause the harness and inspect the run.",
+            })))]
+        )
+
+        async def fake_call_llm(**kwargs):
+            assert kwargs["task"] == "security_reasoning"
+            assert kwargs["temperature"] == 0.1
+            assert kwargs["max_tokens"] == 600
+            assert kwargs["extra_body"] == {"response_format": {"type": "json_object"}}
+            return response
+
+        with patch("agent.auxiliary_client.async_call_llm", fake_call_llm):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/api/auxiliary/security-reasoning",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={
+                        "source": "harness",
+                        "kind": "runaway_detected",
+                        "summary": "Harness turn count crossed threshold.",
+                        "detail": {"turns": 5},
+                        "fallback_proposed_action": "Review the harness run.",
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data == {
+            "severity": "high",
+            "summary": "Harness exceeded its safe turn budget.",
+            "proposed_action": "Pause the harness and inspect the run.",
+            "model": "security_reasoning",
+            "fallback": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_security_reasoning_returns_safe_fallback_on_llm_failure(self, auth_adapter):
+        app = _create_app(auth_adapter)
+
+        async def fake_call_llm(**kwargs):
+            raise RuntimeError("provider credit exhausted")
+
+        with patch("agent.auxiliary_client.async_call_llm", fake_call_llm):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/api/auxiliary/security-reasoning",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={
+                        "source": "domain",
+                        "kind": "domain_unreachable",
+                        "summary": "example.com is unreachable.",
+                        "detail": {"domain": "example.com"},
+                        "fallback_proposed_action": "Check DNS and uptime manually.",
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["fallback"] is True
+        assert data["severity"] == "medium"
+        assert data["summary"] == "example.com is unreachable."
+        assert data["proposed_action"] == "Check DNS and uptime manually."
+        assert data["model"] == "security_reasoning"
+        assert "provider credit exhausted" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_security_reasoning_requires_auth(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/auxiliary/security-reasoning",
+                json={
+                    "source": "harness",
+                    "kind": "runaway_detected",
+                    "summary": "Harness turn count crossed threshold.",
+                    "detail": {},
+                    "fallback_proposed_action": "Review the harness run.",
+                },
+            )
+        assert resp.status == 401
 
 
 # ---------------------------------------------------------------------------
