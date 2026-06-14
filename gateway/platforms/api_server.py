@@ -1414,6 +1414,23 @@ class APIServerAdapter(BasePlatformAdapter):
             raise ValueError("security reasoning response was not a JSON object")
         return parsed
 
+    def _extract_message_text(self, message: Any) -> str:
+        """Return assistant text from provider message fields in priority order."""
+        for field in ("content", "reasoning_content", "reasoning"):
+            value = getattr(message, field, None)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        return ""
+
+    def _extract_brain_reasoning_json(self, content: str) -> Dict[str, Any]:
+        try:
+            return self._extract_security_reasoning_json(content)
+        except (json.JSONDecodeError, ValueError):
+            stripped = content.strip()
+            if stripped:
+                return {"answer": stripped}
+            raise
+
     def _normalize_security_reasoning(self, raw: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
         severity_raw = raw.get("severity")
         severity = severity_raw.strip().lower() if isinstance(severity_raw, str) else ""
@@ -1486,7 +1503,7 @@ class APIServerAdapter(BasePlatformAdapter):
                 extra_body={"response_format": {"type": "json_object"}},
             )
             choice = response.choices[0]
-            content = getattr(getattr(choice, "message", None), "content", None)
+            content = self._extract_message_text(getattr(choice, "message", None))
             if not content:
                 raise ValueError("security reasoning returned empty content")
             result = self._normalize_security_reasoning(self._extract_security_reasoning_json(content), body)
@@ -1546,10 +1563,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 extra_body={"response_format": {"type": "json_object"}, "max_tokens": 800},
             )
             choice = response.choices[0]
-            content = getattr(getattr(choice, "message", None), "content", None)
+            content = self._extract_message_text(getattr(choice, "message", None))
             if not content:
                 raise ValueError("brain reasoning returned empty content")
-            result = self._normalize_brain_reasoning(self._extract_security_reasoning_json(content), body)
+            result = self._normalize_brain_reasoning(self._extract_brain_reasoning_json(content), body)
             return web.json_response(result)
         except Exception as exc:  # noqa: BLE001 - safe fallback keeps Brain Ask non-fatal.
             logger.warning("Brain Ask auxiliary call failed; returning fallback: %s", exc)

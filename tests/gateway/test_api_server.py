@@ -416,6 +416,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/skills", adapter._handle_skills)
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_post("/api/auxiliary/security-reasoning", adapter._handle_security_reasoning)
+    app.router.add_post("/api/auxiliary/brain-ask", adapter._handle_brain_ask)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -559,6 +560,104 @@ class TestSecurityReasoningEndpoint:
                 },
             )
         assert resp.status == 401
+
+
+# ---------------------------------------------------------------------------
+# /api/auxiliary/brain-ask endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestBrainAskEndpoint:
+    @pytest.mark.asyncio
+    async def test_brain_ask_uses_reasoning_content_when_content_empty(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content="",
+                reasoning_content=json.dumps({"answer": "Use the reasoning_content answer."}),
+                reasoning=json.dumps({"answer": "Do not use reasoning second."}),
+            ))]
+        )
+
+        async def fake_call_llm(**kwargs):
+            assert kwargs["task"] == "brain_reasoning"
+            return response
+
+        with patch("agent.auxiliary_client.async_call_llm", fake_call_llm):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/api/auxiliary/brain-ask",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={
+                        "question": "What is this node about?",
+                        "context": {
+                            "selectedNode": {"title": "Node", "cluster": "Brain", "n_chunks": 1, "source": "test"},
+                            "selectedSnippets": ["Node details."],
+                            "neighbors": [],
+                        },
+                        "history": [],
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data == {
+            "answer": "Use the reasoning_content answer.",
+            "model": "brain_reasoning",
+            "fallback": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_brain_ask_uses_reasoning_when_content_and_reasoning_content_empty(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content="",
+                reasoning_content="",
+                reasoning=json.dumps({"answer": "Use the reasoning answer."}),
+            ))]
+        )
+
+        async def fake_call_llm(**kwargs):
+            assert kwargs["task"] == "brain_reasoning"
+            return response
+
+        with patch("agent.auxiliary_client.async_call_llm", fake_call_llm):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/api/auxiliary/brain-ask",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={
+                        "question": "What is this node about?",
+                        "context": {"selectedNode": {"title": "Node"}, "selectedSnippets": [], "neighbors": []},
+                        "history": [],
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["answer"] == "Use the reasoning answer."
+        assert data["fallback"] is False
+
+    @pytest.mark.asyncio
+    async def test_brain_ask_returns_safe_fallback_when_all_message_text_empty(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="", reasoning_content="", reasoning=""))]
+        )
+
+        async def fake_call_llm(**kwargs):
+            return response
+
+        with patch("agent.auxiliary_client.async_call_llm", fake_call_llm):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/api/auxiliary/brain-ask",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={"question": "What is this node about?", "context": {}, "history": []},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["fallback"] is True
+        assert "brain reasoning returned empty content" in data["error"]
 
 
 # ---------------------------------------------------------------------------
