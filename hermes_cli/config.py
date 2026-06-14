@@ -1311,6 +1311,19 @@ DEFAULT_CONFIG = {
             "timeout": 45,
             "extra_body": {"response_format": {"type": "json_object"}},
         },
+        # Brain reasoning — Brain page "Ask this node" Q&A.
+        # Dedicated auxiliary endpoint (`/api/auxiliary/brain-ask`) with a
+        # brain-shaped response: {answer, model, fallback}. Mirrors
+        # security_reasoning routing config so an operator can route it to
+        # a chat-tuned model via `hermes model` without code changes.
+        "brain_reasoning": {
+            "provider": "auto",
+            "model": "",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+            "extra_body": {"response_format": {"type": "json_object"}},
+        },
         "tts_audio_tags": {
             "provider": "auto",
             "model": "",

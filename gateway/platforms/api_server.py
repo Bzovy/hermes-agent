@@ -94,6 +94,7 @@ MAX_NORMALIZED_TEXT_LENGTH = 65_536  # 64 KB cap for normalized content parts
 MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 SECURITY_REASONING_SEVERITIES = {"low", "medium", "high", "critical"}
 SECURITY_REASONING_MODEL_LABEL = "security_reasoning"
+BRAIN_REASONING_MODEL_LABEL = "brain_reasoning"
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1352,6 +1353,16 @@ class APIServerAdapter(BasePlatformAdapter):
             result["error"] = error
         return result
 
+    def _brain_reasoning_fallback(self, body: Dict[str, Any], error: Optional[str] = None) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "answer": "Brain reasoning is currently unavailable. Please try again.",
+            "model": BRAIN_REASONING_MODEL_LABEL,
+            "fallback": True,
+        }
+        if error:
+            result["error"] = error
+        return result
+
     def _build_security_reasoning_prompt(self, body: Dict[str, Any]) -> str:
         return "\n".join([
             "You are the propose-only security reasoning layer for Agentic Master OS.",
@@ -1366,6 +1377,28 @@ class APIServerAdapter(BasePlatformAdapter):
                 "detector_summary": body.get("summary"),
                 "detail": body.get("detail") or {},
                 "fallback_proposed_action": body.get("fallback_proposed_action"),
+            }, separators=(",", ":")),
+        ])
+
+    def _build_brain_reasoning_prompt(self, body: Dict[str, Any]) -> str:
+        context = body.get("context") or {}
+        history = body.get("history") or []
+        return "\n".join([
+            "You are the Brain Q&A assistant for Agentic Master OS.",
+            "The user selected a conversation in the Brain 3D view and is asking a free-form question about it.",
+            "The JSON below contains the selected conversation metadata, its own chunks, semantic nearest neighbors,",
+            "follow-up history, and the current question.",
+            "Answer in a normal assistant voice. Be concise, accurate, and grounded in the provided context.",
+            "If the context does not contain enough information, say so honestly — do not invent.",
+            "",
+            "Return ONLY minified JSON of the shape {\"answer\":\"<your plain-text answer>\"}.",
+            "",
+            "---",
+            "",
+            json.dumps({
+                "question": body.get("question"),
+                "context": context,
+                "history": history,
             }, separators=(",", ":")),
         ])
 
@@ -1407,8 +1440,19 @@ class APIServerAdapter(BasePlatformAdapter):
             "fallback": False,
         }
 
+    def _normalize_brain_reasoning(self, raw: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+        answer_raw = raw.get("answer")
+        answer = answer_raw.strip() if isinstance(answer_raw, str) and answer_raw.strip() else ""
+        if not answer:
+            answer = "Brain reasoning returned an empty answer. Please try again."
+        return {
+            "answer": answer,
+            "model": BRAIN_REASONING_MODEL_LABEL,
+            "fallback": False,
+        }
+
     async def _handle_security_reasoning(self, request: Any) -> Any:
-        """POST /api/auxiliary/security-reasoning — centralized propose-only security reasoning."""
+        """POST /api/auxiliary/security-reasoning — propose-only security reasoning."""
         auth_err = self._check_auth(request)
         if auth_err:
             return auth_err
@@ -1450,6 +1494,66 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001 - fallback preserves audit logging on provider failures.
             logger.warning("Security reasoning auxiliary call failed; returning fallback: %s", exc)
             return web.json_response(self._security_reasoning_fallback(body, str(exc)))
+
+    async def _handle_brain_ask(self, request: Any) -> Any:
+        """POST /api/auxiliary/brain-ask — dedicated Brain Ask Q&A endpoint."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        assert web is not None
+
+        body, error = await self._read_json_body(request)
+        if error:
+            return error
+
+        if not isinstance(body.get("question"), str) or not body["question"].strip():
+            return web.json_response(_openai_error("question is required", code="invalid_request"), status=400)
+        context = body.get("context")
+        if context is None:
+            body["context"] = {}
+        elif not isinstance(context, dict):
+            return web.json_response(_openai_error("context must be a JSON object", code="invalid_request"), status=400)
+        history = body.get("history")
+        if history is None:
+            body["history"] = []
+        elif not isinstance(history, list):
+            return web.json_response(_openai_error("history must be a JSON array", code="invalid_request"), status=400)
+
+        try:
+            from agent.auxiliary_client import async_call_llm
+
+            response = await async_call_llm(
+                task="brain_reasoning",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are the Brain Q&A assistant for Agentic Master OS. "
+                            "Return ONLY strict JSON of the shape {\"answer\":\"<your plain-text answer>\"}. "
+                            "Do not perform actions, do not call tools, do not narrate your reasoning."
+                        ),
+                    },
+                    {"role": "user", "content": self._build_brain_reasoning_prompt(body)},
+                ],
+                temperature=0.1,
+                max_tokens=800,
+                timeout=120,
+                # OpenRouter treats an omitted output cap as "use the model's
+                # maximum output". Some Brain Ask models advertise very large
+                # output caps, which can trip credit checks before a tiny Q&A
+                # response is generated. Keep the dedicated brain endpoint
+                # bounded without changing security_reasoning behavior.
+                extra_body={"response_format": {"type": "json_object"}, "max_tokens": 800},
+            )
+            choice = response.choices[0]
+            content = getattr(getattr(choice, "message", None), "content", None)
+            if not content:
+                raise ValueError("brain reasoning returned empty content")
+            result = self._normalize_brain_reasoning(self._extract_security_reasoning_json(content), body)
+            return web.json_response(result)
+        except Exception as exc:  # noqa: BLE001 - safe fallback keeps Brain Ask non-fatal.
+            logger.warning("Brain Ask auxiliary call failed; returning fallback: %s", exc)
+            return web.json_response(self._brain_reasoning_fallback(body, str(exc)))
 
     def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
         db = self._ensure_session_db()
@@ -4285,6 +4389,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/skills", self._handle_skills)
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
             self._app.router.add_post("/api/auxiliary/security-reasoning", self._handle_security_reasoning)
+            self._app.router.add_post("/api/auxiliary/brain-ask", self._handle_brain_ask)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
