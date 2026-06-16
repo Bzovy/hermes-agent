@@ -417,6 +417,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_get("/v1/toolsets", adapter._handle_toolsets)
     app.router.add_post("/api/auxiliary/security-reasoning", adapter._handle_security_reasoning)
     app.router.add_post("/api/auxiliary/brain-ask", adapter._handle_brain_ask)
+    app.router.add_post("/api/auxiliary/academy-assist", adapter._handle_academy_assist)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -658,6 +659,90 @@ class TestBrainAskEndpoint:
                 data = await resp.json()
         assert data["fallback"] is True
         assert "brain reasoning returned empty content" in data["error"]
+
+
+# ---------------------------------------------------------------------------
+# /api/auxiliary/academy-assist endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestAcademyAssistEndpoint:
+    @pytest.mark.asyncio
+    async def test_academy_assist_uses_reasoning_content_when_content_empty(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content="",
+                reasoning_content=json.dumps({"answer": "Start by listing the givens, then solve one step at a time."}),
+                reasoning=json.dumps({"answer": "Do not use reasoning second."}),
+            ))]
+        )
+
+        async def fake_call_llm(**kwargs):
+            assert kwargs["task"] == "academy_assist"
+            assert kwargs["temperature"] == 0.2
+            assert kwargs["max_tokens"] == 1000
+            assert kwargs["extra_body"] == {"response_format": {"type": "json_object"}, "max_tokens": 1000}
+            assert "study tutor" in kwargs["messages"][0]["content"]
+            return response
+
+        with patch("agent.auxiliary_client.async_call_llm", fake_call_llm):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/api/auxiliary/academy-assist",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={
+                        "question": "How should I begin?",
+                        "assignment": {
+                            "title": "Algebra worksheet",
+                            "description": "Solve linear equations.",
+                            "due_date": 1790000000000,
+                            "course": {"name": "Algebra 101"},
+                        },
+                        "history": [],
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data == {
+            "answer": "Start by listing the givens, then solve one step at a time.",
+            "model": "academy_assist",
+            "fallback": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_academy_assist_returns_safe_fallback_when_all_message_text_empty(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="", reasoning_content="", reasoning=""))]
+        )
+
+        async def fake_call_llm(**kwargs):
+            return response
+
+        with patch("agent.auxiliary_client.async_call_llm", fake_call_llm):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/api/auxiliary/academy-assist",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={"question": "Help me plan this", "assignment": {}, "history": []},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["fallback"] is True
+        assert data["model"] == "academy_assist"
+        assert "academy assist returned empty content" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_academy_assist_validates_assignment_shape(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/auxiliary/academy-assist",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"question": "Help", "assignment": [], "history": []},
+            )
+        assert resp.status == 400
 
 
 # ---------------------------------------------------------------------------

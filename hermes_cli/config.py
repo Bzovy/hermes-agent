@@ -1324,6 +1324,18 @@ DEFAULT_CONFIG = {
             "timeout": 120,
             "extra_body": {"response_format": {"type": "json_object"}},
         },
+        # Academy Assist — Academy page assignment tutoring Q&A.
+        # Dedicated auxiliary endpoint (`/api/auxiliary/academy-assist`) with an
+        # academy-shaped response: {answer, model, fallback}. Defaults to the
+        # same MiniMax M3 tutor model used by brain_reasoning.
+        "academy_assist": {
+            "provider": "openrouter",
+            "model": "minimax/minimax-m3",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+            "extra_body": {"response_format": {"type": "json_object"}},
+        },
         "tts_audio_tags": {
             "provider": "auto",
             "model": "",

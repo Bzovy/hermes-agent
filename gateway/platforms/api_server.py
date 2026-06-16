@@ -95,6 +95,7 @@ MAX_CONTENT_LIST_SIZE = 1_000  # Max items when content is an array
 SECURITY_REASONING_SEVERITIES = {"low", "medium", "high", "critical"}
 SECURITY_REASONING_MODEL_LABEL = "security_reasoning"
 BRAIN_REASONING_MODEL_LABEL = "brain_reasoning"
+ACADEMY_ASSIST_MODEL_LABEL = "academy_assist"
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1363,6 +1364,16 @@ class APIServerAdapter(BasePlatformAdapter):
             result["error"] = error
         return result
 
+    def _academy_assist_fallback(self, body: Dict[str, Any], error: Optional[str] = None) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "answer": "Academy tutoring is currently unavailable. Please try again.",
+            "model": ACADEMY_ASSIST_MODEL_LABEL,
+            "fallback": True,
+        }
+        if error:
+            result["error"] = error
+        return result
+
     def _build_security_reasoning_prompt(self, body: Dict[str, Any]) -> str:
         return "\n".join([
             "You are the propose-only security reasoning layer for Agentic Master OS.",
@@ -1398,6 +1409,27 @@ class APIServerAdapter(BasePlatformAdapter):
             json.dumps({
                 "question": body.get("question"),
                 "context": context,
+                "history": history,
+            }, separators=(",", ":")),
+        ])
+
+    def _build_academy_assist_prompt(self, body: Dict[str, Any]) -> str:
+        assignment = body.get("assignment") or {}
+        history = body.get("history") or []
+        return "\n".join([
+            "You are the Academy tutor for Agentic Master OS.",
+            "The user is asking for help with a school assignment. Help them understand the work and make progress.",
+            "Break the task into steps, explain relevant concepts, help outline or draft study notes, suggest research/study approaches,",
+            "and ask clarifying questions when needed. Do NOT simply complete graded work dishonestly or produce a final submission",
+            "that the student can pass off as their own. Encourage understanding, cite uncertainty, and make the student an active participant.",
+            "",
+            "Return ONLY minified JSON of the shape {\"answer\":\"<your plain-text tutoring answer>\"}.",
+            "",
+            "---",
+            "",
+            json.dumps({
+                "question": body.get("question"),
+                "assignment": assignment,
                 "history": history,
             }, separators=(",", ":")),
         ])
@@ -1465,6 +1497,17 @@ class APIServerAdapter(BasePlatformAdapter):
         return {
             "answer": answer,
             "model": BRAIN_REASONING_MODEL_LABEL,
+            "fallback": False,
+        }
+
+    def _normalize_academy_assist(self, raw: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+        answer_raw = raw.get("answer")
+        answer = answer_raw.strip() if isinstance(answer_raw, str) and answer_raw.strip() else ""
+        if not answer:
+            answer = "Academy tutoring returned an empty answer. Please try again."
+        return {
+            "answer": answer,
+            "model": ACADEMY_ASSIST_MODEL_LABEL,
             "fallback": False,
         }
 
@@ -1571,6 +1614,62 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001 - safe fallback keeps Brain Ask non-fatal.
             logger.warning("Brain Ask auxiliary call failed; returning fallback: %s", exc)
             return web.json_response(self._brain_reasoning_fallback(body, str(exc)))
+
+
+    async def _handle_academy_assist(self, request: Any) -> Any:
+        """POST /api/auxiliary/academy-assist — dedicated Academy tutoring endpoint."""
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        assert web is not None
+
+        body, error = await self._read_json_body(request)
+        if error:
+            return error
+
+        if not isinstance(body.get("question"), str) or not body["question"].strip():
+            return web.json_response(_openai_error("question is required", code="invalid_request"), status=400)
+        assignment = body.get("assignment")
+        if assignment is None:
+            body["assignment"] = {}
+        elif not isinstance(assignment, dict):
+            return web.json_response(_openai_error("assignment must be a JSON object", code="invalid_request"), status=400)
+        history = body.get("history")
+        if history is None:
+            body["history"] = []
+        elif not isinstance(history, list):
+            return web.json_response(_openai_error("history must be a JSON array", code="invalid_request"), status=400)
+
+        try:
+            from agent.auxiliary_client import async_call_llm
+
+            response = await async_call_llm(
+                task="academy_assist",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a helpful study tutor. Help students understand assignments, break work into steps, "
+                            "explain concepts, outline, draft study notes, and plan their work. Do not help them cheat, "
+                            "plagiarize, or submit graded work dishonestly. Return strict JSON only."
+                        ),
+                    },
+                    {"role": "user", "content": self._build_academy_assist_prompt(body)},
+                ],
+                temperature=0.2,
+                max_tokens=1000,
+                timeout=120,
+                extra_body={"response_format": {"type": "json_object"}, "max_tokens": 1000},
+            )
+            choice = response.choices[0]
+            content = self._extract_message_text(getattr(choice, "message", None))
+            if not content:
+                raise ValueError("academy assist returned empty content")
+            result = self._normalize_academy_assist(self._extract_brain_reasoning_json(content), body)
+            return web.json_response(result)
+        except Exception as exc:  # noqa: BLE001 - safe fallback keeps Academy Assist non-fatal.
+            logger.warning("Academy Assist auxiliary call failed; returning fallback: %s", exc)
+            return web.json_response(self._academy_assist_fallback(body, str(exc)))
 
     def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
         db = self._ensure_session_db()
@@ -4407,6 +4506,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/v1/toolsets", self._handle_toolsets)
             self._app.router.add_post("/api/auxiliary/security-reasoning", self._handle_security_reasoning)
             self._app.router.add_post("/api/auxiliary/brain-ask", self._handle_brain_ask)
+            self._app.router.add_post("/api/auxiliary/academy-assist", self._handle_academy_assist)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
