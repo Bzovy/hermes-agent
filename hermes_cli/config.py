@@ -1336,6 +1336,20 @@ DEFAULT_CONFIG = {
             "timeout": 120,
             "extra_body": {"response_format": {"type": "json_object"}},
         },
+        # Journal Reflect — Journal page "Reflect with AI" companion.
+        # Dedicated auxiliary endpoint (`/api/auxiliary/journal-reflect`) with
+        # the same {answer, model, fallback} shape as academy_assist. Two modes:
+        # "prompt" (give a journaling prompt) and "reflect" (respond to a written
+        # entry). Higher temperature (0.7) for warmth; capped at 500 tokens since
+        # reflections are short. Defaults to the same MiniMax M3 model.
+        "journal_reflect": {
+            "provider": "openrouter",
+            "model": "minimax/minimax-m3",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 90,
+            "extra_body": {"response_format": {"type": "json_object"}},
+        },
         "tts_audio_tags": {
             "provider": "auto",
             "model": "",

@@ -96,6 +96,7 @@ SECURITY_REASONING_SEVERITIES = {"low", "medium", "high", "critical"}
 SECURITY_REASONING_MODEL_LABEL = "security_reasoning"
 BRAIN_REASONING_MODEL_LABEL = "brain_reasoning"
 ACADEMY_ASSIST_MODEL_LABEL = "academy_assist"
+JOURNAL_REFLECT_MODEL_LABEL = "journal_reflect"
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1374,6 +1375,16 @@ class APIServerAdapter(BasePlatformAdapter):
             result["error"] = error
         return result
 
+    def _journal_reflect_fallback(self, body: Dict[str, Any], error: Optional[str] = None) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "answer": "Journal reflection is currently unavailable. Please try again.",
+            "model": JOURNAL_REFLECT_MODEL_LABEL,
+            "fallback": True,
+        }
+        if error:
+            result["error"] = error
+        return result
+
     def _build_security_reasoning_prompt(self, body: Dict[str, Any]) -> str:
         return "\n".join([
             "You are the propose-only security reasoning layer for Agentic Master OS.",
@@ -1431,6 +1442,56 @@ class APIServerAdapter(BasePlatformAdapter):
                 "question": body.get("question"),
                 "assignment": assignment,
                 "history": history,
+            }, separators=(",", ":")),
+        ])
+
+    def _build_journal_reflect_prompt(self, body: Dict[str, Any]) -> str:
+        """Build the user-side prompt for the journal-reflection companion.
+
+        Two modes (driven by whether an entry is supplied):
+
+        - "prompt"   — caller wants a journaling prompt / reflection
+                       question (e.g. "I'm feeling stuck, give me a prompt").
+                       `entry` is empty/absent. Output a single warm question
+                       and a short framing line.
+        - "reflect"  — caller wrote an entry and wants a reflective response.
+                       `entry` is a string with their thoughts. Output a
+                       short, warm reflection that names what they wrote
+                       without re-quoting it wholesale, and offers one
+                       open-ended follow-up question.
+
+        The system prompt establishes the warm/supportive/non-clinical tone.
+        """
+        entry = body.get("entry")
+        mode = "reflect" if isinstance(entry, str) and entry.strip() else "prompt"
+        history = body.get("history") or []
+        mood = body.get("mood")
+        tags = body.get("tags")
+        journal_type = body.get("journal_type")
+
+        meta_lines = []
+        if isinstance(mood, str) and mood.strip():
+            meta_lines.append(f"mood: {mood.strip()}")
+        if isinstance(tags, str) and tags.strip():
+            meta_lines.append(f"tags: {tags.strip()}")
+        if isinstance(journal_type, str) and journal_type.strip():
+            meta_lines.append(f"type: {journal_type.strip()}")
+
+        return "\n".join([
+            "Respond in a warm, grounded, non-clinical tone — like a thoughtful friend who reads carefully.",
+            "Be concise (3-6 sentences for reflect, 1-2 sentences for a prompt).",
+            "Do not pathologize. Do not diagnose. Do not give medical, legal, or financial advice.",
+            "If the entry expresses crisis or self-harm ideation, gently suggest reaching out to a trusted person or local crisis line; do not attempt to counsel.",
+            "",
+            "Return ONLY minified JSON of the shape {\"answer\":\"<your reflection>\"}.",
+            "",
+            "---",
+            "",
+            json.dumps({
+                "mode": mode,
+                "entry": entry if mode == "reflect" else None,
+                "history": history,
+                "meta": meta_lines,
             }, separators=(",", ":")),
         ])
 
@@ -1508,6 +1569,17 @@ class APIServerAdapter(BasePlatformAdapter):
         return {
             "answer": answer,
             "model": ACADEMY_ASSIST_MODEL_LABEL,
+            "fallback": False,
+        }
+
+    def _normalize_journal_reflect(self, raw: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+        answer_raw = raw.get("answer")
+        answer = answer_raw.strip() if isinstance(answer_raw, str) and answer_raw.strip() else ""
+        if not answer:
+            answer = "Journal reflection returned an empty answer. Please try again."
+        return {
+            "answer": answer,
+            "model": JOURNAL_REFLECT_MODEL_LABEL,
             "fallback": False,
         }
 
@@ -1670,6 +1742,82 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001 - safe fallback keeps Academy Assist non-fatal.
             logger.warning("Academy Assist auxiliary call failed; returning fallback: %s", exc)
             return web.json_response(self._academy_assist_fallback(body, str(exc)))
+
+    async def _handle_journal_reflect(self, request: Any) -> Any:
+        """POST /api/auxiliary/journal-reflect — journaling companion (prompt or reflect).
+
+        Two modes:
+        - Prompt:  caller asks for a journaling prompt (entry is empty/absent).
+        - Reflect: caller supplies an entry and wants a short warm reflection.
+
+        Both share the same response shape `{answer, model, fallback}` as the
+        other auxiliary endpoints so the aioncore relay can reuse its
+        normalization helper.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        assert web is not None
+
+        body, error = await self._read_json_body(request)
+        if error:
+            return error
+
+        # `entry` is optional (prompt mode = empty). Validate the type if present.
+        entry = body.get("entry")
+        if entry is not None and not isinstance(entry, str):
+            return web.json_response(_openai_error("entry must be a string", code="invalid_request"), status=400)
+        if entry is None:
+            body["entry"] = ""
+
+        history = body.get("history")
+        if history is None:
+            body["history"] = []
+        elif not isinstance(history, list):
+            return web.json_response(_openai_error("history must be a JSON array", code="invalid_request"), status=400)
+
+        # mood / tags / journal_type are optional strings. Normalize empty
+        # to absent so the prompt builder can omit them cleanly.
+        for field in ("mood", "tags", "journal_type"):
+            value = body.get(field)
+            if value is not None and not isinstance(value, str):
+                return web.json_response(_openai_error(f"{field} must be a string", code="invalid_request"), status=400)
+            if isinstance(value, str) and not value.strip():
+                body[field] = None
+
+        try:
+            from agent.auxiliary_client import async_call_llm
+
+            response = await async_call_llm(
+                task="journal_reflect",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are a warm, grounded journaling companion. When given an entry, you reflect back what you "
+                            "noticed in a few sentences and offer one open-ended follow-up question. When asked for a "
+                            "prompt, you offer a single evocative question. Tone: like a thoughtful friend who reads "
+                            "carefully — never clinical, never diagnostic. Do not give medical, legal, or financial advice. "
+                            "If the entry expresses crisis or self-harm ideation, gently suggest reaching out to a trusted "
+                            "person or local crisis line; do not attempt to counsel."
+                        ),
+                    },
+                    {"role": "user", "content": self._build_journal_reflect_prompt(body)},
+                ],
+                temperature=0.7,
+                max_tokens=500,
+                timeout=90,
+                extra_body={"response_format": {"type": "json_object"}, "max_tokens": 500},
+            )
+            choice = response.choices[0]
+            content = self._extract_message_text(getattr(choice, "message", None))
+            if not content:
+                raise ValueError("journal reflect returned empty content")
+            result = self._normalize_journal_reflect(self._extract_brain_reasoning_json(content), body)
+            return web.json_response(result)
+        except Exception as exc:  # noqa: BLE001 - safe fallback keeps Journal Reflect non-fatal.
+            logger.warning("Journal Reflect auxiliary call failed; returning fallback: %s", exc)
+            return web.json_response(self._journal_reflect_fallback(body, str(exc)))
 
     def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
         db = self._ensure_session_db()
@@ -4507,6 +4655,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/auxiliary/security-reasoning", self._handle_security_reasoning)
             self._app.router.add_post("/api/auxiliary/brain-ask", self._handle_brain_ask)
             self._app.router.add_post("/api/auxiliary/academy-assist", self._handle_academy_assist)
+            self._app.router.add_post("/api/auxiliary/journal-reflect", self._handle_journal_reflect)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)

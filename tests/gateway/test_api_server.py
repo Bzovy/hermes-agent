@@ -418,6 +418,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/auxiliary/security-reasoning", adapter._handle_security_reasoning)
     app.router.add_post("/api/auxiliary/brain-ask", adapter._handle_brain_ask)
     app.router.add_post("/api/auxiliary/academy-assist", adapter._handle_academy_assist)
+    app.router.add_post("/api/auxiliary/journal-reflect", adapter._handle_journal_reflect)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -745,9 +746,122 @@ class TestAcademyAssistEndpoint:
         assert resp.status == 400
 
 
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
+# /api/auxiliary/journal-reflect endpoint
+# --------------------------------------------------------------------------
+
+
+class TestJournalReflectEndpoint:
+    @pytest.mark.asyncio
+    async def test_journal_reflect_uses_reasoning_content_when_content_empty(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content="",
+                reasoning_content=json.dumps({"answer": "That sounds like a heavy day. What was the smallest piece of it?"}),
+                reasoning=json.dumps({"answer": "Do not use reasoning second."}),
+            ))]
+        )
+
+        async def fake_call_llm(**kwargs):
+            assert kwargs["task"] == "journal_reflect"
+            assert kwargs["temperature"] == 0.7
+            assert kwargs["max_tokens"] == 500
+            assert kwargs["extra_body"] == {"response_format": {"type": "json_object"}, "max_tokens": 500}
+            assert "journaling companion" in kwargs["messages"][0]["content"]
+            # entry was supplied → prompt builder should embed it as mode=reflect.
+            user_payload = json.loads(kwargs["messages"][1]["content"].split("\n\n---\n\n", 1)[1])
+            assert user_payload["mode"] == "reflect"
+            assert user_payload["entry"] == "Today was hard."
+            return response
+
+        with patch("agent.auxiliary_client.async_call_llm", fake_call_llm):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/api/auxiliary/journal-reflect",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={
+                        "entry": "Today was hard.",
+                        "history": [],
+                        "mood": "tired",
+                        "tags": "work",
+                        "journal_type": "personal",
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data == {
+            "answer": "That sounds like a heavy day. What was the smallest piece of it?",
+            "model": "journal_reflect",
+            "fallback": False,
+        }
+
+    @pytest.mark.asyncio
+    async def test_journal_reflect_prompt_mode_when_entry_empty(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content=json.dumps({"answer": "What's one small thing you're grateful for today?"}),
+            ))]
+        )
+
+        async def fake_call_llm(**kwargs):
+            user_payload = json.loads(kwargs["messages"][1]["content"].split("\n\n---\n\n", 1)[1])
+            assert user_payload["mode"] == "prompt"
+            assert user_payload["entry"] is None
+            return response
+
+        with patch("agent.auxiliary_client.async_call_llm", fake_call_llm):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/api/auxiliary/journal-reflect",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={"entry": "", "history": []},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["answer"] == "What's one small thing you're grateful for today?"
+        assert data["model"] == "journal_reflect"
+        assert data["fallback"] is False
+
+    @pytest.mark.asyncio
+    async def test_journal_reflect_returns_safe_fallback_when_all_message_text_empty(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content="", reasoning_content="", reasoning=""))]
+        )
+
+        async def fake_call_llm(**kwargs):
+            return response
+
+        with patch("agent.auxiliary_client.async_call_llm", fake_call_llm):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/api/auxiliary/journal-reflect",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={"entry": "Hello", "history": []},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["fallback"] is True
+        assert data["model"] == "journal_reflect"
+        assert "journal reflect returned empty content" in data["error"]
+
+    @pytest.mark.asyncio
+    async def test_journal_reflect_validates_entry_type(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/auxiliary/journal-reflect",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"entry": ["not", "a", "string"], "history": []},
+            )
+        assert resp.status == 400
+
+
+# --------------------------------------------------------------------------
 # /health endpoint
-# ---------------------------------------------------------------------------
+# --------------------------------------------------------------------------
 
 
 class TestHealthEndpoint:
