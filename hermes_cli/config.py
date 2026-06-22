@@ -1350,6 +1350,25 @@ DEFAULT_CONFIG = {
             "timeout": 90,
             "extra_body": {"response_format": {"type": "json_object"}},
         },
+        # Research Reasoning — Deep Research page in-loop LLM.
+        # Dedicated auxiliary endpoint (`/api/auxiliary/research-reasoning`) used
+        # by aioncore's research loop for two distinct steps per round:
+        #   1. Query refinement — turn the user's question + prior findings into
+        #      a sharper web search query (returns {"query": "..."}).
+        #   2. Synthesis — turn the final round's findings + source URLs into a
+        #      cited report (returns {"answer": "...markdown with [n] citations..."}).
+        # Same {answer, model, fallback} envelope as academy_assist / journal_reflect
+        # so the aioncore relay can reuse its normalization helper. Defaults to
+        # the same MiniMax M3 model. Higher max_tokens (1500) since the synthesis
+        # step returns a full markdown report.
+        "research_reasoning": {
+            "provider": "openrouter",
+            "model": "minimax/minimax-m3",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+            "extra_body": {"response_format": {"type": "json_object"}, "max_tokens": 1500},
+        },
         "tts_audio_tags": {
             "provider": "auto",
             "model": "",

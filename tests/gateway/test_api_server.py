@@ -419,6 +419,7 @@ def _create_app(adapter: APIServerAdapter) -> web.Application:
     app.router.add_post("/api/auxiliary/brain-ask", adapter._handle_brain_ask)
     app.router.add_post("/api/auxiliary/academy-assist", adapter._handle_academy_assist)
     app.router.add_post("/api/auxiliary/journal-reflect", adapter._handle_journal_reflect)
+    app.router.add_post("/api/auxiliary/research-reasoning", adapter._handle_research_reasoning)
     app.router.add_post("/v1/chat/completions", adapter._handle_chat_completions)
     app.router.add_post("/v1/responses", adapter._handle_responses)
     app.router.add_get("/v1/responses/{response_id}", adapter._handle_get_response)
@@ -857,6 +858,116 @@ class TestJournalReflectEndpoint:
                 json={"entry": ["not", "a", "string"], "history": []},
             )
         assert resp.status == 400
+
+
+# --------------------------------------------------------------------------
+# /api/auxiliary/research-reasoning endpoint
+# --------------------------------------------------------------------------
+
+
+class TestResearchReasoningEndpoint:
+    @pytest.mark.asyncio
+    async def test_research_reasoning_refine_query_normalizes_envelope(self, auth_adapter):
+        """refine_query task should serialize the model's `query` field into the answer JSON."""
+        app = _create_app(auth_adapter)
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content=json.dumps({"query": "agentic master os research loop"}),
+                reasoning_content="",
+                reasoning="",
+            ))]
+        )
+
+        async def fake_call_llm(**kwargs):
+            assert kwargs["task"] == "research_reasoning"
+            assert kwargs["max_tokens"] == 1500
+            assert kwargs["extra_body"] == {"response_format": {"type": "json_object"}, "max_tokens": 1500}
+            # The prompt builder should encode the task + question in the user payload.
+            user_payload = json.loads(kwargs["messages"][1]["content"].split("\n\n---\n\n", 1)[1])
+            assert user_payload["task"] == "refine_query"
+            assert user_payload["original_question"] == "What is AMO?"
+            return response
+
+        with patch("agent.auxiliary_client.async_call_llm", fake_call_llm):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/api/auxiliary/research-reasoning",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={"task": "refine_query", "question": "What is AMO?"},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["model"] == "research_reasoning"
+        assert data["fallback"] is False
+        envelope = json.loads(data["answer"])
+        assert envelope["task"] == "refine_query"
+        assert envelope["query"] == "agentic master os research loop"
+
+    @pytest.mark.asyncio
+    async def test_research_reasoning_synthesize_report_passes_through_answer(self, auth_adapter):
+        """synthesize_report task should pass the model's markdown report through unchanged."""
+        app = _create_app(auth_adapter)
+        report_md = "# Findings\n\nAMO is a desktop AI OS [1].\n\n## Sources\n\n[1] https://agenticmaster.ai"
+        response = SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(
+                content=json.dumps({"answer": report_md}),
+                reasoning_content="",
+                reasoning="",
+            ))]
+        )
+
+        async def fake_call_llm(**kwargs):
+            return response
+
+        with patch("agent.auxiliary_client.async_call_llm", fake_call_llm):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/api/auxiliary/research-reasoning",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={
+                        "task": "synthesize_report",
+                        "question": "What is AMO?",
+                        "prior_findings": [{"text": "AMO is a desktop AI OS", "citation": 1}],
+                        "sources": [{"url": "https://agenticmaster.ai", "title": "AMO"}],
+                    },
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        envelope = json.loads(data["answer"])
+        assert envelope["task"] == "synthesize_report"
+        assert envelope["answer"] == report_md
+
+    @pytest.mark.asyncio
+    async def test_research_reasoning_rejects_unknown_task(self, auth_adapter):
+        app = _create_app(auth_adapter)
+        async with TestClient(TestServer(app)) as cli:
+            resp = await cli.post(
+                "/api/auxiliary/research-reasoning",
+                headers={"Authorization": "Bearer sk-secret"},
+                json={"task": "make_coffee", "question": "What is AMO?"},
+            )
+            assert resp.status == 400
+
+    @pytest.mark.asyncio
+    async def test_research_reasoning_returns_safe_fallback_on_exception(self, auth_adapter):
+        """If the LLM call raises, the endpoint should still return the {answer,model,fallback} envelope."""
+        app = _create_app(auth_adapter)
+
+        async def fake_call_llm(**kwargs):
+            raise RuntimeError("upstream LLM timeout")
+
+        with patch("agent.auxiliary_client.async_call_llm", fake_call_llm):
+            async with TestClient(TestServer(app)) as cli:
+                resp = await cli.post(
+                    "/api/auxiliary/research-reasoning",
+                    headers={"Authorization": "Bearer sk-secret"},
+                    json={"task": "refine_query", "question": "What is AMO?"},
+                )
+                assert resp.status == 200
+                data = await resp.json()
+        assert data["fallback"] is True
+        assert data["model"] == "research_reasoning"
+        assert "unavailable" in data["answer"].lower()
 
 
 # --------------------------------------------------------------------------

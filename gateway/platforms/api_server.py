@@ -97,6 +97,7 @@ SECURITY_REASONING_MODEL_LABEL = "security_reasoning"
 BRAIN_REASONING_MODEL_LABEL = "brain_reasoning"
 ACADEMY_ASSIST_MODEL_LABEL = "academy_assist"
 JOURNAL_REFLECT_MODEL_LABEL = "journal_reflect"
+RESEARCH_REASONING_MODEL_LABEL = "research_reasoning"
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1385,6 +1386,16 @@ class APIServerAdapter(BasePlatformAdapter):
             result["error"] = error
         return result
 
+    def _research_reasoning_fallback(self, body: Dict[str, Any], error: Optional[str] = None) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "answer": "Research reasoning is currently unavailable. Please try again.",
+            "model": RESEARCH_REASONING_MODEL_LABEL,
+            "fallback": True,
+        }
+        if error:
+            result["error"] = error
+        return result
+
     def _build_security_reasoning_prompt(self, body: Dict[str, Any]) -> str:
         return "\n".join([
             "You are the propose-only security reasoning layer for Agentic Master OS.",
@@ -1444,6 +1455,82 @@ class APIServerAdapter(BasePlatformAdapter):
                 "history": history,
             }, separators=(",", ":")),
         ])
+
+    def _build_research_reasoning_prompt(self, body: Dict[str, Any]) -> str:
+        """Build the user-side prompt for the Deep Research in-loop reasoning step.
+
+        The Deep Research loop in aioncore calls this endpoint twice per round
+        (or once on the final round), with `task` selecting the mode:
+
+        - "refine_query": return {"query": "<sharper web search query>"} given
+          the user's question, prior round queries, and what has already been
+          found. Sharpen, narrow, or pivot to a new angle.
+        - "extract_findings": return {"findings": [...]} summarizing 1-3
+          concrete findings extracted from a batch of fetched page texts,
+          each finding carrying a citation index that maps to the source
+          list. Findings should be terse declarative statements, not prose.
+        - "synthesize_report": return {"answer": "<markdown report with
+          [n] citations>"} on the final round, weaving all extracted
+          findings + their source URLs into a structured markdown report
+          with numbered citations.
+        """
+        task = (body.get("task") or "refine_query").strip()
+        question = body.get("question") or ""
+        round_index = body.get("round") or 0
+        prior_queries = body.get("prior_queries") or []
+        prior_findings = body.get("prior_findings") or []
+        pages = body.get("pages") or []
+        sources = body.get("sources") or []
+
+        system_lines = [
+            "You are the in-loop reasoning step for Agentic Master OS's Deep Research tool.",
+            "You are precise, skeptical of web sources, and always cite with [n] where n is the 1-based index into the sources list provided to you.",
+            "Return ONLY minified JSON matching the shape requested below. No prose around it.",
+        ]
+
+        if task == "refine_query":
+            shape = '{"query": "<the refined search query, 2-12 words, plain text, no operators>"}'
+            payload = {
+                "task": "refine_query",
+                "round": round_index,
+                "original_question": question,
+                "prior_queries_so_far": prior_queries,
+                "what_we_already_know": prior_findings,
+            }
+        elif task == "extract_findings":
+            shape = '{"findings": [{"text": "<one declarative sentence>", "citation": <int 1-based source index>, "quote": "<short verbatim excerpt, optional>"}]}'
+            payload = {
+                "task": "extract_findings",
+                "round": round_index,
+                "question": question,
+                "pages_to_extract_from": [
+                    {"source_index": idx + 1, "url": src.get("url"), "title": src.get("title"), "text_excerpt": (page_text or "")[:4000]}
+                    for idx, (src, page_text) in enumerate(zip(sources, pages))
+                ],
+            }
+        elif task == "synthesize_report":
+            shape = '{"answer": "<full markdown report, 400-1200 words, with numbered [n] citations>"}'
+            payload = {
+                "task": "synthesize_report",
+                "original_question": question,
+                "all_findings": prior_findings,
+                "sources": sources,
+            }
+        else:
+            shape = '{"answer": "<unknown task>"}'
+            payload = {"task": task, "question": question}
+
+        return "\n".join(
+            system_lines
+            + [
+                "",
+                f"Required JSON shape: {shape}",
+                "",
+                "---",
+                "",
+                json.dumps(payload, separators=(",", ":")),
+            ]
+        )
 
     def _build_journal_reflect_prompt(self, body: Dict[str, Any]) -> str:
         """Build the user-side prompt for the journal-reflection companion.
@@ -1580,6 +1667,53 @@ class APIServerAdapter(BasePlatformAdapter):
         return {
             "answer": answer,
             "model": JOURNAL_REFLECT_MODEL_LABEL,
+            "fallback": False,
+        }
+
+    def _normalize_research_reasoning(self, raw: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize research_reasoning output across its three task shapes.
+
+        The same envelope (`{answer, model, fallback}`) is returned for all
+        three tasks so the aioncore relay can use one normalization helper.
+        The task-specific payload is serialized into `answer` as JSON.
+        """
+        task = (body.get("task") or "refine_query").strip()
+        # Serialize whatever the model returned into a JSON envelope inside
+        # `answer`. aioncore deserializes back based on the task it requested.
+        if isinstance(raw, dict):
+            payload = raw
+        else:
+            payload = {"answer": ""}
+        # Trim trailing whitespace from any nested string fields.
+        def _trim(value: Any) -> Any:
+            if isinstance(value, str):
+                return value.strip()
+            if isinstance(value, list):
+                return [_trim(v) for v in value]
+            if isinstance(value, dict):
+                return {k: _trim(v) for k, v in value.items()}
+            return value
+        payload = _trim(payload)
+        if task == "refine_query":
+            query = payload.get("query") if isinstance(payload.get("query"), str) else ""
+            if not query:
+                # Fall back to the original question so the loop can still
+                # make a search call instead of deadlocking.
+                query = (body.get("question") or "").strip()
+            answer_text = json.dumps({"task": task, "query": query}, separators=(",", ":"))
+        elif task == "extract_findings":
+            findings = payload.get("findings") if isinstance(payload.get("findings"), list) else []
+            answer_text = json.dumps({"task": task, "findings": findings}, separators=(",", ":"))
+        elif task == "synthesize_report":
+            report = payload.get("answer") if isinstance(payload.get("answer"), str) else ""
+            if not report:
+                report = "Research synthesis returned an empty report."
+            answer_text = json.dumps({"task": task, "answer": report}, separators=(",", ":"))
+        else:
+            answer_text = json.dumps({"task": task, "answer": ""}, separators=(",", ":"))
+        return {
+            "answer": answer_text,
+            "model": RESEARCH_REASONING_MODEL_LABEL,
             "fallback": False,
         }
 
@@ -1818,6 +1952,70 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001 - safe fallback keeps Journal Reflect non-fatal.
             logger.warning("Journal Reflect auxiliary call failed; returning fallback: %s", exc)
             return web.json_response(self._journal_reflect_fallback(body, str(exc)))
+
+    async def _handle_research_reasoning(self, request: Any) -> Any:
+        """POST /api/auxiliary/research-reasoning — Deep Research in-loop reasoning.
+
+        Used by aioncore's research loop for three distinct tasks:
+          - refine_query   (every round)       → next search query
+          - extract_findings (every round)    → terse findings from fetched pages
+          - synthesize_report (final round)   → cited markdown report
+
+        Same `{answer, model, fallback}` envelope as the other auxiliary
+        endpoints. The task-specific payload is JSON inside `answer`.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        assert web is not None
+
+        body, error = await self._read_json_body(request)
+        if error:
+            return error
+
+        task = (body.get("task") or "").strip()
+        if task not in {"refine_query", "extract_findings", "synthesize_report"}:
+            return web.json_response(
+                _openai_error(
+                    "task must be one of refine_query|extract_findings|synthesize_report",
+                    code="invalid_request",
+                ),
+                status=400,
+            )
+        question = body.get("question")
+        if not isinstance(question, str) or not question.strip():
+            return web.json_response(_openai_error("question is required", code="invalid_request"), status=400)
+
+        try:
+            from agent.auxiliary_client import async_call_llm
+
+            response = await async_call_llm(
+                task="research_reasoning",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are the in-loop reasoning step for Agentic Master OS's Deep Research tool. "
+                            "You are precise, skeptical of web sources, and always cite with [n] where n is "
+                            "the 1-based index into the sources list provided. Return ONLY the requested JSON."
+                        ),
+                    },
+                    {"role": "user", "content": self._build_research_reasoning_prompt(body)},
+                ],
+                temperature=0.3,
+                max_tokens=1500,
+                timeout=120,
+                extra_body={"response_format": {"type": "json_object"}, "max_tokens": 1500},
+            )
+            choice = response.choices[0]
+            content = self._extract_message_text(getattr(choice, "message", None))
+            if not content:
+                raise ValueError("research reasoning returned empty content")
+            result = self._normalize_research_reasoning(self._extract_brain_reasoning_json(content), body)
+            return web.json_response(result)
+        except Exception as exc:  # noqa: BLE001 - safe fallback keeps Research non-fatal.
+            logger.warning("Research Reasoning auxiliary call failed; returning fallback: %s", exc)
+            return web.json_response(self._research_reasoning_fallback(body, str(exc)))
 
     def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
         db = self._ensure_session_db()
@@ -4656,6 +4854,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/auxiliary/brain-ask", self._handle_brain_ask)
             self._app.router.add_post("/api/auxiliary/academy-assist", self._handle_academy_assist)
             self._app.router.add_post("/api/auxiliary/journal-reflect", self._handle_journal_reflect)
+            self._app.router.add_post("/api/auxiliary/research-reasoning", self._handle_research_reasoning)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
