@@ -1352,6 +1352,22 @@ DEFAULT_CONFIG = {
             "timeout": 120,
             "extra_body": {"response_format": {"type": "json_object"}},
         },
+        # Lawyer Assist — Lawyer page first-draft legal helper.
+        # Dedicated auxiliary endpoint (`/api/auxiliary/lawyer-assist`) with
+        # the same {answer, model, fallback} envelope as academy_assist. Two
+        # modes: "review" (flag risks in a pasted clause/contract) and
+        # "generate" (first-draft a document from a short brief). The
+        # normalizer injects a persistent NOT-LEGAL-ADVICE disclaimer into
+        # the JSON payload so the UI can always surface it. Defaults to
+        # the same MiniMax M3 model.
+        "lawyer_assist": {
+            "provider": "openrouter",
+            "model": "minimax/minimax-m3",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+            "extra_body": {"response_format": {"type": "json_object"}},
+        },
         # Journal Reflect — Journal page "Reflect with AI" companion.
         # Dedicated auxiliary endpoint (`/api/auxiliary/journal-reflect`) with
         # the same {answer, model, fallback} shape as academy_assist. Two modes:

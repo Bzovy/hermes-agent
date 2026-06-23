@@ -99,6 +99,7 @@ ACADEMY_ASSIST_MODEL_LABEL = "academy_assist"
 JOURNAL_REFLECT_MODEL_LABEL = "journal_reflect"
 RESEARCH_REASONING_MODEL_LABEL = "research_reasoning"
 SEO_ASSIST_MODEL_LABEL = "seo_assist"
+LAWYER_ASSIST_MODEL_LABEL = "lawyer_assist"
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1387,6 +1388,16 @@ class APIServerAdapter(BasePlatformAdapter):
             result["error"] = error
         return result
 
+    def _lawyer_assist_fallback(self, body: Dict[str, Any], error: Optional[str] = None) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "answer": "Lawyer Assist is currently unavailable. Please try again. REMINDER: This tool is not legal advice; consult a licensed attorney for any legal matter.",
+            "model": LAWYER_ASSIST_MODEL_LABEL,
+            "fallback": True,
+        }
+        if error:
+            result["error"] = error
+        return result
+
     def _journal_reflect_fallback(self, body: Dict[str, Any], error: Optional[str] = None) -> Dict[str, Any]:
         result: Dict[str, Any] = {
             "answer": "Journal reflection is currently unavailable. Please try again.",
@@ -1510,6 +1521,87 @@ class APIServerAdapter(BasePlatformAdapter):
                 "target_keyword": target_keyword,
                 "content": content,
             }, separators=(",", ":")),
+        ])
+
+    def _build_lawyer_assist_prompt(self, body: Dict[str, Any]) -> str:
+        """Build the user-side prompt for the Lawyer Assist endpoint.
+
+        Two modes share the same response shape:
+
+          - "review":   user pasted a clause/contract/document and wants
+                        flagged risks, missing protections, ambiguities,
+                        and suggested redlines.
+          - "generate": user gave a short brief (e.g., "NDA between two
+                        startups in Delaware") and wants a first-draft
+                        template in plain text with placeholders for
+                        parties, term, jurisdiction, etc.
+
+        PERSISTENT NOT-LEGAL-ADVICE DISCLAIMER: the system prompt above
+        always asserts that this tool is not legal advice. The response
+        normalizer also injects a `disclaimer` field into the JSON
+        payload so the UI can surface it even if the model forgets.
+        """
+        mode = (body.get("mode") or "review").strip().lower()
+        if mode not in ("review", "generate"):
+            mode = "review"
+        text = (body.get("text") or "").strip()
+        jurisdiction = (body.get("jurisdiction") or "").strip()
+        doc_type = (body.get("doc_type") or "").strip()
+        brief = (body.get("brief") or "").strip()
+
+        system_lines = [
+            "You are Lawyer Assist for Agentic Master OS — an AI helper that produces a FIRST DRAFT for the user to take to a real lawyer.",
+            "You are precise, conservative, and clearly disclaim legal authority at all times.",
+            "NEVER give legal advice. NEVER recommend specific legal strategies as if they were attorney guidance.",
+            "Always speak in second person and use neutral phrasing ('you may want to consider...', 'a common approach is...', 'this is not legal advice...').",
+            "Always include a `disclaimer` field in your JSON output stating that the response is not legal advice.",
+            "Return ONLY minified JSON matching the shape requested below. No prose around it, no markdown fences.",
+        ]
+
+        if mode == "review":
+            shape = (
+                "{"
+                "\"summary\": \"<one-paragraph plain-English summary of what the document says>\","
+                "\"issues\": [\"<each issue: short bullet, e.g. 'Unilateral termination clause — you can be terminated for any reason with 7 days notice'>],"
+                "\"suggestions\": [\"<each suggestion: concrete redline idea in plain English, e.g. 'Add a mutual termination clause'>],"
+                "\"risk_level\": \"<one of: low | medium | high>\","
+                "\"missing_protections\": [\"<e.g. 'No governing-law clause', 'No limitation of liability'>],"
+                "\"disclaimer\": \"<NOT LEGAL ADVICE — short sentence reminding the user to consult a licensed attorney>\""
+                "}"
+            )
+            payload = {
+                "mode": "review",
+                "jurisdiction": jurisdiction,
+                "doc_type": doc_type,
+                "text": text,
+            }
+        else:
+            shape = (
+                "{"
+                "\"title\": \"<short title for the document, e.g. 'Mutual Non-Disclosure Agreement'>\","
+                "\"sections\": [{\"heading\": \"<e.g. '1. Definitions'>\", \"body\": \"<paragraph text, may include [PARTY A] / [TERM] placeholders>\"}],"
+                "\"placeholders\": [\"<list of square-bracket placeholders the user must fill in, e.g. '[PARTY A NAME]'>],"
+                "\"notes\": [\"<short bullet comments explaining non-obvious clauses or things to double-check with a lawyer>\"],"
+                "\"disclaimer\": \"<NOT LEGAL ADVICE — short sentence reminding the user to consult a licensed attorney>\""
+                "}"
+            )
+            payload = {
+                "mode": "generate",
+                "doc_type": doc_type,
+                "jurisdiction": jurisdiction,
+                "brief": brief or text,
+            }
+
+        return "\n".join([
+            *system_lines,
+            "",
+            f"Mode: {mode}.",
+            "Return ONLY minified JSON of EXACTLY this shape (no extra keys, no prose around it):",
+            shape,
+            "",
+            "---",
+            "",
+            json.dumps(payload, separators=(",", ":")),
         ])
 
     def _build_research_reasoning_prompt(self, body: Dict[str, Any]) -> str:
@@ -1769,6 +1861,60 @@ class APIServerAdapter(BasePlatformAdapter):
         return {
             "answer": answer_text,
             "model": SEO_ASSIST_MODEL_LABEL,
+            "fallback": False,
+        }
+
+    def _normalize_lawyer_assist(self, raw: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize the Lawyer LLM JSON into the {answer, model, fallback} envelope.
+
+        Same shape as SEO: the renderer parses `answer` as JSON to render
+        the structured sections (mode, summary, issues[], suggestions[],
+        risk_level, disclaimer). The mode-specific payload (review vs
+        generate) is serialized into `answer` so the aioncore relay can
+        forward it verbatim. The persistent NOT-LEGAL-ADVICE disclaimer is
+        always appended to the answer text so the UI can surface it
+        prominently even if the model forgets.
+        """
+        if not isinstance(raw, dict):
+            payload = {}
+        else:
+            payload = raw
+
+        def _trim(value: Any) -> Any:
+            if isinstance(value, str):
+                return value.strip()
+            if isinstance(value, list):
+                return [_trim(v) for v in value]
+            if isinstance(value, dict):
+                return {k: _trim(v) for k, v in value.items()}
+            return value
+
+        payload = _trim(payload)
+        mode = (body.get("mode") or "review").strip().lower()
+        if mode not in ("review", "generate"):
+            mode = "review"
+
+        # Inject the mode so the renderer doesn't have to track it separately.
+        payload.setdefault("mode", mode)
+        # Persistent disclaimer — append to the answer text regardless of
+        # whether the LLM remembered to include it. The UI also surfaces
+        # a static disclaimer in the page chrome.
+        disclaimer = (
+            "NOT LEGAL ADVICE. This tool is an AI assistant for educational "
+            "and informational purposes only. It does not create an "
+            "attorney-client relationship and is not a substitute for a "
+            "licensed attorney. For any legal matter, consult a qualified "
+            "lawyer in your jurisdiction."
+        )
+        payload.setdefault("disclaimer", disclaimer)
+
+        answer_text = json.dumps(payload, separators=(",", ":"))
+        if not answer_text:
+            answer_text = json.dumps({"mode": mode, "disclaimer": disclaimer}, separators=(",", ":"))
+
+        return {
+            "answer": answer_text,
+            "model": LAWYER_ASSIST_MODEL_LABEL,
             "fallback": False,
         }
 
@@ -2062,6 +2208,103 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001 - safe fallback keeps SEO Assist non-fatal.
             logger.warning("SEO Assist auxiliary call failed; returning fallback: %s", exc)
             return web.json_response(self._seo_assist_fallback(body, str(exc)))
+
+    async def _handle_lawyer_assist(self, request: Any) -> Any:
+        """POST /api/auxiliary/lawyer-assist — first-draft legal helper.
+
+        Body shape:
+          {
+            "mode":        "review" | "generate",   // default: review
+            "text":        "<clause/contract text for review, OR brief for generate>",
+            "jurisdiction": "<optional, e.g. 'Delaware, USA'>",
+            "doc_type":    "<optional, e.g. 'NDA', 'SaaS MSA'>"
+          }
+
+        Response shape (same envelope as academy_assist / seo_assist so the
+        aioncore relay can reuse its normalization helper):
+          {
+            "answer":   "<JSON string the renderer parses>",
+            "model":    "lawyer_assist",
+            "fallback": false,
+            "error":    "<optional>"
+          }
+
+        The persisted NOT-LEGAL-ADVICE disclaimer is enforced in the
+        system prompt and also injected into the JSON `disclaimer` field
+        by the response normalizer so the UI can always surface it.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        assert web is not None
+
+        body, error = await self._read_json_body(request)
+        if error:
+            return error
+
+        # Validate mode + text. Default mode is "review".
+        mode = (body.get("mode") or "review").strip().lower()
+        if mode not in ("review", "generate"):
+            return web.json_response(
+                _openai_error("mode must be 'review' or 'generate'", code="invalid_request"), status=400
+            )
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return web.json_response(_openai_error("text is required", code="invalid_request"), status=400)
+        jurisdiction = body.get("jurisdiction") or ""
+        if not isinstance(jurisdiction, str):
+            return web.json_response(
+                _openai_error("jurisdiction must be a string", code="invalid_request"), status=400
+            )
+        doc_type = body.get("doc_type") or ""
+        if not isinstance(doc_type, str):
+            return web.json_response(
+                _openai_error("doc_type must be a string", code="invalid_request"), status=400
+            )
+        brief = body.get("brief") or ""
+        if not isinstance(brief, str):
+            return web.json_response(
+                _openai_error("brief must be a string", code="invalid_request"), status=400
+            )
+
+        body["mode"] = mode
+        body["text"] = text
+        body["jurisdiction"] = jurisdiction
+        body["doc_type"] = doc_type
+        body["brief"] = brief
+
+        try:
+            from agent.auxiliary_client import async_call_llm
+
+            response = await async_call_llm(
+                task="lawyer_assist",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are Lawyer Assist for Agentic Master OS. You produce FIRST DRAFTS for users to take to a "
+                            "real lawyer. You NEVER give legal advice. You ALWAYS include a 'disclaimer' field in your "
+                            "JSON output stating that the response is not legal advice and that the user should consult "
+                            "a licensed attorney. You always return strict minified JSON. No prose, no markdown, no code "
+                            "fences around the JSON."
+                        ),
+                    },
+                    {"role": "user", "content": self._build_lawyer_assist_prompt(body)},
+                ],
+                temperature=0.2,
+                max_tokens=1500,
+                timeout=120,
+                extra_body={"response_format": {"type": "json_object"}, "max_tokens": 1500},
+            )
+            choice = response.choices[0]
+            content_text = self._extract_message_text(getattr(choice, "message", None))
+            if not content_text:
+                raise ValueError("lawyer assist returned empty content")
+            result = self._normalize_lawyer_assist(self._extract_brain_reasoning_json(content_text), body)
+            return web.json_response(result)
+        except Exception as exc:  # noqa: BLE001 - safe fallback keeps Lawyer Assist non-fatal.
+            logger.warning("Lawyer Assist auxiliary call failed; returning fallback: %s", exc)
+            return web.json_response(self._lawyer_assist_fallback(body, str(exc)))
 
     async def _handle_journal_reflect(self, request: Any) -> Any:
         """POST /api/auxiliary/journal-reflect — journaling companion (prompt or reflect).
@@ -5040,6 +5283,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/auxiliary/brain-ask", self._handle_brain_ask)
             self._app.router.add_post("/api/auxiliary/academy-assist", self._handle_academy_assist)
             self._app.router.add_post("/api/auxiliary/seo-assist", self._handle_seo_assist)
+            self._app.router.add_post("/api/auxiliary/lawyer-assist", self._handle_lawyer_assist)
             self._app.router.add_post("/api/auxiliary/journal-reflect", self._handle_journal_reflect)
             self._app.router.add_post("/api/auxiliary/research-reasoning", self._handle_research_reasoning)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
