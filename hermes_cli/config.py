@@ -1336,6 +1336,22 @@ DEFAULT_CONFIG = {
             "timeout": 120,
             "extra_body": {"response_format": {"type": "json_object"}},
         },
+        # SEO Assist — SEO tool analyzer.
+        # Dedicated auxiliary endpoint (`/api/auxiliary/seo-assist`) with the
+        # same {answer, model, fallback} envelope as academy_assist. The
+        # renderer (SEO page) posts page content + optional URL + optional
+        # target_keyword; the model returns strict JSON with title_tag,
+        # meta_description, keywords[], content_notes[], readability; we
+        # serialize that payload into `answer` for the aioncore relay to
+        # forward verbatim. Defaults to the same MiniMax M3 model.
+        "seo_assist": {
+            "provider": "openrouter",
+            "model": "minimax/minimax-m3",
+            "base_url": "",
+            "api_key": "",
+            "timeout": 120,
+            "extra_body": {"response_format": {"type": "json_object"}},
+        },
         # Journal Reflect — Journal page "Reflect with AI" companion.
         # Dedicated auxiliary endpoint (`/api/auxiliary/journal-reflect`) with
         # the same {answer, model, fallback} shape as academy_assist. Two modes:

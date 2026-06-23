@@ -98,6 +98,7 @@ BRAIN_REASONING_MODEL_LABEL = "brain_reasoning"
 ACADEMY_ASSIST_MODEL_LABEL = "academy_assist"
 JOURNAL_REFLECT_MODEL_LABEL = "journal_reflect"
 RESEARCH_REASONING_MODEL_LABEL = "research_reasoning"
+SEO_ASSIST_MODEL_LABEL = "seo_assist"
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1376,6 +1377,16 @@ class APIServerAdapter(BasePlatformAdapter):
             result["error"] = error
         return result
 
+    def _seo_assist_fallback(self, body: Dict[str, Any], error: Optional[str] = None) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "answer": "SEO analysis is currently unavailable. Please try again.",
+            "model": SEO_ASSIST_MODEL_LABEL,
+            "fallback": True,
+        }
+        if error:
+            result["error"] = error
+        return result
+
     def _journal_reflect_fallback(self, body: Dict[str, Any], error: Optional[str] = None) -> Dict[str, Any]:
         result: Dict[str, Any] = {
             "answer": "Journal reflection is currently unavailable. Please try again.",
@@ -1453,6 +1464,51 @@ class APIServerAdapter(BasePlatformAdapter):
                 "question": body.get("question"),
                 "assignment": assignment,
                 "history": history,
+            }, separators=(",", ":")),
+        ])
+
+    def _build_seo_assist_prompt(self, body: Dict[str, Any]) -> str:
+        """Build the user-side prompt for the SEO analyzer.
+
+        The renderer sends either pasted page content or a URL + (optional)
+        fetched content + an optional target keyword. The LLM is asked to
+        return STRICT JSON with five sections the UI can render directly:
+
+          - title_tag          : string, <= 60 chars
+          - meta_description   : string, <= 160 chars
+          - keywords           : array of 5-10 short strings
+          - content_notes      : array of short bullet strings (improvements)
+          - readability        : string, short paragraph assessment
+
+        If the model has nothing useful to suggest for a section, it should
+        return an empty string / empty array rather than omitting the key.
+        """
+        content = (body.get("content") or "").strip()
+        url = (body.get("url") or "").strip()
+        target_keyword = (body.get("target_keyword") or "").strip()
+        return "\n".join([
+            "You are an expert SEO analyst for Agentic Master OS.",
+            "Given the page content (and optional URL + target keyword) below, produce concrete, actionable SEO suggestions.",
+            "Be specific and grounded in the actual text — quote short phrases from the content where useful.",
+            "",
+            "Return ONLY minified JSON with EXACTLY these five keys (no extra keys, no prose around the JSON):",
+            "{",
+            "  \"title_tag\": \"<string, <= 60 chars, include the target keyword near the start if one was provided>\",",
+            "  \"meta_description\": \"<string, <= 160 chars, include the target keyword once if one was provided>\",",
+            "  \"keywords\": [\"<5-10 short lowercase keyword phrases, derived from the content; mix head terms and long-tail>\"],",
+            "  \"content_notes\": [\"<short bullet strings; concrete suggestions: missing sections, weak intros, thin coverage, internal-link opportunities, etc.>\"],",
+            "  \"readability\": \"<short paragraph assessment: audience fit, sentence length, jargon level, structure>\"",
+            "}",
+            "",
+            "If the content is too short to suggest anything useful for a section, return an empty string or empty array for that key rather than omitting it.",
+            "Do not invent facts about the page that aren't in the content. If a URL was provided but no content, just analyze whatever the user wrote in the content field.",
+            "",
+            "---",
+            "",
+            json.dumps({
+                "url": url,
+                "target_keyword": target_keyword,
+                "content": content,
             }, separators=(",", ":")),
         ])
 
@@ -1656,6 +1712,63 @@ class APIServerAdapter(BasePlatformAdapter):
         return {
             "answer": answer,
             "model": ACADEMY_ASSIST_MODEL_LABEL,
+            "fallback": False,
+        }
+
+    def _normalize_seo_assist(self, raw: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize the SEO LLM JSON into the {answer, model, fallback} envelope.
+
+        The renderer expects a single `answer` string it can JSON.parse into the
+        five structured fields it renders. We serialize whatever the model
+        returned (after trimming strings) into that envelope so the aioncore
+        relay can reuse its normalization helper. If the model returned no JSON
+        or only the empty string, we fall back to a generic message.
+        """
+        if not isinstance(raw, dict):
+            payload = {}
+        else:
+            payload = raw
+
+        def _trim(value: Any) -> Any:
+            if isinstance(value, str):
+                return value.strip()
+            if isinstance(value, list):
+                return [_trim(v) for v in value]
+            if isinstance(value, dict):
+                return {k: _trim(v) for k, v in value.items()}
+            return value
+
+        payload = _trim(payload)
+        # If the model wrapped the structured fields under a top-level
+        # "result"/"seo"/"analysis" key, hoist them up so the renderer can
+        # render the sections directly. Otherwise we trust whatever keys it
+        # returned (title, meta_description, keywords, content_notes,
+        # readability).
+        for wrapper in ("result", "seo", "analysis", "data"):
+            inner = payload.get(wrapper)
+            if isinstance(inner, dict):
+                payload = {**payload, **inner}
+                payload.pop(wrapper, None)
+
+        # If the model gave us only a flat string under `answer` (not a
+        # structured payload), wrap it so the renderer's JSON.parse still has
+        # something to show.
+        flat = payload.get("answer")
+        if isinstance(flat, str) and (
+            "title" not in payload
+            and "title_tag" not in payload
+            and "meta_description" not in payload
+        ):
+            answer_text = flat.strip() or "SEO analysis returned no structured suggestions."
+        else:
+            answer_text = json.dumps(payload, separators=(",", ":"))
+
+        if not answer_text:
+            answer_text = "SEO analysis returned no suggestions. Please try again."
+
+        return {
+            "answer": answer_text,
+            "model": SEO_ASSIST_MODEL_LABEL,
             "fallback": False,
         }
 
@@ -1876,6 +1989,79 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001 - safe fallback keeps Academy Assist non-fatal.
             logger.warning("Academy Assist auxiliary call failed; returning fallback: %s", exc)
             return web.json_response(self._academy_assist_fallback(body, str(exc)))
+
+    async def _handle_seo_assist(self, request: Any) -> Any:
+        """POST /api/auxiliary/seo-assist — dedicated SEO analyzer endpoint.
+
+        Body shape:
+          {
+            "content":         "<pasted page content, required>",
+            "url":             "<optional source URL>",
+            "target_keyword":  "<optional keyword to optimize for>"
+          }
+
+        Response shape (same envelope as academy_assist / journal_reflect so
+        the aioncore relay can reuse its normalization helper):
+          {
+            "answer":   "<JSON string with the five structured fields the UI renders>",
+            "model":    "seo_assist",
+            "fallback": false,
+            "error":    "<optional, only on failure>"
+          }
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        assert web is not None
+
+        body, error = await self._read_json_body(request)
+        if error:
+            return error
+
+        content = body.get("content")
+        if not isinstance(content, str) or not content.strip():
+            return web.json_response(_openai_error("content is required", code="invalid_request"), status=400)
+        # Optional fields, all coerced to strings.
+        url = body.get("url") or ""
+        if not isinstance(url, str):
+            return web.json_response(_openai_error("url must be a string", code="invalid_request"), status=400)
+        target_keyword = body.get("target_keyword") or ""
+        if not isinstance(target_keyword, str):
+            return web.json_response(
+                _openai_error("target_keyword must be a string", code="invalid_request"), status=400
+            )
+        body["url"] = url
+        body["target_keyword"] = target_keyword
+
+        try:
+            from agent.auxiliary_client import async_call_llm
+
+            response = await async_call_llm(
+                task="seo_assist",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are an expert SEO analyst. You always return strict minified JSON with the exact "
+                            "five keys requested. No prose, no markdown, no code fences around the JSON."
+                        ),
+                    },
+                    {"role": "user", "content": self._build_seo_assist_prompt(body)},
+                ],
+                temperature=0.2,
+                max_tokens=1200,
+                timeout=120,
+                extra_body={"response_format": {"type": "json_object"}, "max_tokens": 1200},
+            )
+            choice = response.choices[0]
+            content_text = self._extract_message_text(getattr(choice, "message", None))
+            if not content_text:
+                raise ValueError("seo assist returned empty content")
+            result = self._normalize_seo_assist(self._extract_brain_reasoning_json(content_text), body)
+            return web.json_response(result)
+        except Exception as exc:  # noqa: BLE001 - safe fallback keeps SEO Assist non-fatal.
+            logger.warning("SEO Assist auxiliary call failed; returning fallback: %s", exc)
+            return web.json_response(self._seo_assist_fallback(body, str(exc)))
 
     async def _handle_journal_reflect(self, request: Any) -> Any:
         """POST /api/auxiliary/journal-reflect — journaling companion (prompt or reflect).
@@ -4853,6 +5039,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/auxiliary/security-reasoning", self._handle_security_reasoning)
             self._app.router.add_post("/api/auxiliary/brain-ask", self._handle_brain_ask)
             self._app.router.add_post("/api/auxiliary/academy-assist", self._handle_academy_assist)
+            self._app.router.add_post("/api/auxiliary/seo-assist", self._handle_seo_assist)
             self._app.router.add_post("/api/auxiliary/journal-reflect", self._handle_journal_reflect)
             self._app.router.add_post("/api/auxiliary/research-reasoning", self._handle_research_reasoning)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
