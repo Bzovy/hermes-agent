@@ -100,6 +100,7 @@ JOURNAL_REFLECT_MODEL_LABEL = "journal_reflect"
 RESEARCH_REASONING_MODEL_LABEL = "research_reasoning"
 SEO_ASSIST_MODEL_LABEL = "seo_assist"
 LAWYER_ASSIST_MODEL_LABEL = "lawyer_assist"
+MEDICAL_ASSIST_MODEL_LABEL = "medical_assist"
 
 
 def _coerce_port(value: Any, default: int = DEFAULT_PORT) -> int:
@@ -1398,6 +1399,16 @@ class APIServerAdapter(BasePlatformAdapter):
             result["error"] = error
         return result
 
+    def _medical_assist_fallback(self, body: Dict[str, Any], error: Optional[str] = None) -> Dict[str, Any]:
+        result: Dict[str, Any] = {
+            "answer": "Medical Assist is currently unavailable. Please try again. REMINDER: This tool is for patient education and navigation only — not medical advice. Always consult a licensed healthcare professional for diagnosis, treatment, or medical decisions.",
+            "model": MEDICAL_ASSIST_MODEL_LABEL,
+            "fallback": True,
+        }
+        if error:
+            result["error"] = error
+        return result
+
     def _journal_reflect_fallback(self, body: Dict[str, Any], error: Optional[str] = None) -> Dict[str, Any]:
         result: Dict[str, Any] = {
             "answer": "Journal reflection is currently unavailable. Please try again.",
@@ -1597,6 +1608,45 @@ class APIServerAdapter(BasePlatformAdapter):
             "",
             f"Mode: {mode}.",
             "Return ONLY minified JSON of EXACTLY this shape (no extra keys, no prose around it):",
+            shape,
+            "",
+            "---",
+            "",
+            json.dumps(payload, separators=(",", ":")),
+        ])
+
+    def _build_medical_assist_prompt(self, body: Dict[str, Any]) -> str:
+        """Build the user-side prompt for Medical Assist endpoint.
+
+        Two modes: understand (explain medical terms) and find_specialist (navigate care).
+        """
+        mode = (body.get("mode") or "understand").strip().lower()
+        if mode not in ("understand", "find_specialist"):
+            mode = "understand"
+        text = (body.get("text") or "").strip()
+        context = (body.get("context") or "").strip()
+
+        system_lines = [
+            "You are Medical Assist for Agentic Master OS — an AI helper for patient education and healthcare navigation.",
+            "NEVER diagnose, prescribe, or provide medical advice. Always include a disclaimer field.",
+            "Emergency symptoms (chest pain, stroke, breathing trouble, severe bleeding): ALWAYS direct to 911 or ER.",
+            "Mental health crisis or self-harm: ALWAYS suggest 988 Suicide & Crisis Lifeline. NEVER provide harmful info.",
+            "REFUSE dangerous requests (overdose, drug misuse, self-harm methods).",
+            "Return ONLY minified JSON. No prose, markdown, or code fences.",
+        ]
+
+        if mode == "understand":
+            shape = '{"title": "<short title>", "what_it_is": "<paragraph>", "what_it_affects": "<paragraph>", "common_symptoms": [<items>], "next_steps": "<paragraph>", "disclaimer": "<NOT MEDICAL ADVICE>"}'
+            payload = {"mode": "understand", "text": text, "context": context}
+        else:
+            shape = '{"condition_summary": "<one sentence>", "specialist_types": [<items>], "finding_advice": "<paragraph>", "when_to_seek_urgent_care": "<paragraph>", "disclaimer": "<NOT MEDICAL ADVICE>"}'
+            payload = {"mode": "find_specialist", "text": text, "context": context}
+
+        return "\n".join([
+            *system_lines,
+            "",
+            f"Mode: {mode}.",
+            "Return ONLY minified JSON of EXACTLY this shape:",
             shape,
             "",
             "---",
@@ -1915,6 +1965,47 @@ class APIServerAdapter(BasePlatformAdapter):
         return {
             "answer": answer_text,
             "model": LAWYER_ASSIST_MODEL_LABEL,
+            "fallback": False,
+        }
+
+    def _normalize_medical_assist(self, raw: Dict[str, Any], body: Dict[str, Any]) -> Dict[str, Any]:
+        """Normalize Medical Assist JSON into {answer, model, fallback} envelope."""
+        if not isinstance(raw, dict):
+            payload = {}
+        else:
+            payload = raw
+
+        def _trim(value: Any) -> Any:
+            if isinstance(value, str):
+                return value.strip()
+            if isinstance(value, list):
+                return [_trim(v) for v in value]
+            if isinstance(value, dict):
+                return {k: _trim(v) for k, v in value.items()}
+            return value
+
+        payload = _trim(payload)
+        mode = (body.get("mode") or "understand").strip().lower()
+        if mode not in ("understand", "find_specialist"):
+            mode = "understand"
+
+        payload.setdefault("mode", mode)
+        disclaimer = (
+            "NOT MEDICAL ADVICE. This tool is for patient education and healthcare navigation only. "
+            "It is NOT a substitute for professional medical diagnosis, treatment, or advice. "
+            "ALWAYS consult a licensed healthcare professional for any medical concerns. "
+            "For medical emergencies (chest pain, stroke signs, severe bleeding, difficulty breathing): call 911 or ER. "
+            "For mental health crisis or self-harm thoughts: contact 988 Suicide & Crisis Lifeline immediately."
+        )
+        payload.setdefault("disclaimer", disclaimer)
+
+        answer_text = json.dumps(payload, separators=(",", ":"))
+        if not answer_text:
+            answer_text = json.dumps({"mode": mode, "disclaimer": disclaimer}, separators=(",", ":"))
+
+        return {
+            "answer": answer_text,
+            "model": MEDICAL_ASSIST_MODEL_LABEL,
             "fallback": False,
         }
 
@@ -2305,6 +2396,79 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as exc:  # noqa: BLE001 - safe fallback keeps Lawyer Assist non-fatal.
             logger.warning("Lawyer Assist auxiliary call failed; returning fallback: %s", exc)
             return web.json_response(self._lawyer_assist_fallback(body, str(exc)))
+
+    async def _handle_medical_assist(self, request: Any) -> Any:
+        """POST /api/auxiliary/medical-assist — patient education and healthcare navigation.
+
+        Body shape:
+          {
+            "mode":    "understand" | "find_specialist",  // default: understand
+            "text":    "<medical term/description>",
+            "context": "<optional additional context>"
+          }
+
+        Response: {answer: "<JSON string>", model: "medical_assist", fallback: false}
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        assert web is not None
+
+        body, error = await self._read_json_body(request)
+        if error:
+            return error
+
+        mode = (body.get("mode") or "understand").strip().lower()
+        if mode not in ("understand", "find_specialist"):
+            return web.json_response(
+                _openai_error("mode must be 'understand' or 'find_specialist'", code="invalid_request"), status=400
+            )
+        text = body.get("text")
+        if not isinstance(text, str) or not text.strip():
+            return web.json_response(_openai_error("text is required", code="invalid_request"), status=400)
+        context = body.get("context") or ""
+        if not isinstance(context, str):
+            return web.json_response(
+                _openai_error("context must be a string", code="invalid_request"), status=400
+            )
+
+        body["mode"] = mode
+        body["text"] = text
+        body["context"] = context
+
+        try:
+            from agent.auxiliary_client import async_call_llm
+
+            response = await async_call_llm(
+                task="medical_assist",
+                messages=[
+                    {
+                        "role": "system",
+                        "content": (
+                            "You are Medical Assist for Agentic Master OS. You provide patient education and healthcare navigation only. "
+                            "You are NOT a doctor. You NEVER diagnose, prescribe, or provide medical advice. "
+                            "You ALWAYS include a 'disclaimer' field in your JSON output. "
+                            "For emergencies (chest pain, stroke, breathing trouble, severe bleeding): direct to 911/ER. "
+                            "For mental health crisis or self-harm: suggest 988 Lifeline; never provide harmful info. "
+                            "You return strict minified JSON only. No prose, markdown, or code fences."
+                        ),
+                    },
+                    {"role": "user", "content": self._build_medical_assist_prompt(body)},
+                ],
+                temperature=0.3,
+                max_tokens=1000,
+                timeout=120,
+                extra_body={"response_format": {"type": "json_object"}, "max_tokens": 1000},
+            )
+            choice = response.choices[0]
+            content_text = self._extract_message_text(getattr(choice, "message", None))
+            if not content_text:
+                raise ValueError("medical assist returned empty content")
+            result = self._normalize_medical_assist(self._extract_brain_reasoning_json(content_text), body)
+            return web.json_response(result)
+        except Exception as exc:  # noqa: BLE001 - safe fallback keeps Medical Assist non-fatal.
+            logger.warning("Medical Assist auxiliary call failed; returning fallback: %s", exc)
+            return web.json_response(self._medical_assist_fallback(body, str(exc)))
 
     async def _handle_journal_reflect(self, request: Any) -> Any:
         """POST /api/auxiliary/journal-reflect — journaling companion (prompt or reflect).
@@ -5284,6 +5448,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/auxiliary/academy-assist", self._handle_academy_assist)
             self._app.router.add_post("/api/auxiliary/seo-assist", self._handle_seo_assist)
             self._app.router.add_post("/api/auxiliary/lawyer-assist", self._handle_lawyer_assist)
+            self._app.router.add_post("/api/auxiliary/medical-assist", self._handle_medical_assist)
             self._app.router.add_post("/api/auxiliary/journal-reflect", self._handle_journal_reflect)
             self._app.router.add_post("/api/auxiliary/research-reasoning", self._handle_research_reasoning)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
