@@ -58,6 +58,7 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
+from gateway.platforms import investments_handler
 
 logger = logging.getLogger(__name__)
 
@@ -5554,6 +5555,21 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/auxiliary/journal-reflect", self._handle_journal_reflect)
             self._app.router.add_post("/api/auxiliary/research-reasoning", self._handle_research_reasoning)
             self._app.router.add_get("/api/auxiliary/openrouter/balance", self._handle_openrouter_balance)
+            # Investments API (holdings, accounts, quotes, portfolio aggregation)
+            self._app.router.add_get("/api/investments/holdings", investments_handler.handle_holdings_list)
+            self._app.router.add_post("/api/investments/holdings", investments_handler.handle_holdings_create)
+            self._app.router.add_put("/api/investments/holdings/{id}", investments_handler.handle_holdings_update)
+            self._app.router.add_delete("/api/investments/holdings/{id}", investments_handler.handle_holdings_delete)
+            self._app.router.add_get("/api/investments/accounts", investments_handler.handle_accounts_list)
+            self._app.router.add_post("/api/investments/accounts", investments_handler.handle_accounts_create)
+            self._app.router.add_put("/api/investments/accounts/{id}", investments_handler.handle_accounts_update)
+            self._app.router.add_delete("/api/investments/accounts/{id}", investments_handler.handle_accounts_delete)
+            self._app.router.add_get("/api/investments/watchlist", investments_handler.handle_watchlist_list)
+            self._app.router.add_post("/api/investments/watchlist", investments_handler.handle_watchlist_create)
+            self._app.router.add_delete("/api/investments/watchlist/{id}", investments_handler.handle_watchlist_delete)
+            self._app.router.add_post("/api/investments/quotes", investments_handler.handle_quotes)
+            self._app.router.add_get("/api/investments/portfolio-aggregation", investments_handler.handle_portfolio_aggregation)
+            self._app.router.add_get("/api/investments/networth-summary", investments_handler.handle_networth_summary)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
