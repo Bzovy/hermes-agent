@@ -2610,6 +2610,108 @@ class APIServerAdapter(BasePlatformAdapter):
             logger.warning("Research Reasoning auxiliary call failed; returning fallback: %s", exc)
             return web.json_response(self._research_reasoning_fallback(body, str(exc)))
 
+
+    async def _handle_openrouter_balance(self, request: Any) -> Any:
+        """GET /api/auxiliary/openrouter/balance — OpenRouter account credits balance.
+        
+        Reads OPENROUTER_API_KEY from environment and fetches the user's current
+        credit balance from OpenRouter's https://openrouter.ai/api/v1/credits
+        endpoint.
+        
+        Response shape: { "data": { "total_credits": <n>, "total_usage": <n> } }
+        Returns JSON with:
+        - credits_remaining: float (total_credits - total_usage)
+        - total_credits: float (total purchased)
+        - total_usage: float (total consumed)
+        - error: optional string if fetch failed
+        """
+        import httpx
+        import os
+        
+        assert web is not None
+        
+        api_key = os.getenv("OPENROUTER_API_KEY")
+        if not api_key:
+            logger.warning("OPENROUTER_API_KEY not configured; returning zero balance")
+            return web.json_response(
+                {
+                    "credits_remaining": 0.0,
+                    "total_credits": 0.0,
+                    "total_usage": 0.0,
+                    "error": "OpenRouter API key not configured",
+                },
+                status=200
+            )
+        
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.get(
+                    "https://openrouter.ai/api/v1/credits",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                )
+                
+                if response.status_code == 401:
+                    logger.warning("OpenRouter API key invalid or expired")
+                    return web.json_response(
+                        {
+                            "credits_remaining": 0.0,
+                            "total_credits": 0.0,
+                            "total_usage": 0.0,
+                            "error": "OpenRouter API key invalid or expired",
+                        },
+                        status=200
+                    )
+                
+                if response.status_code != 200:
+                    logger.warning(f"OpenRouter API error: HTTP {response.status_code}")
+                    return web.json_response(
+                        {
+                            "credits_remaining": 0.0,
+                            "total_credits": 0.0,
+                            "total_usage": 0.0,
+                            "error": f"OpenRouter API returned HTTP {response.status_code}",
+                        },
+                        status=200
+                    )
+                
+                data = response.json()
+                # OpenRouter response: { "data": { "total_credits": <n>, "total_usage": <n> } }
+                credits_data = data.get("data", {})
+                total_credits = float(credits_data.get("total_credits", 0))
+                total_usage = float(credits_data.get("total_usage", 0))
+                
+                return web.json_response(
+                    {
+                        "credits_remaining": total_credits - total_usage,
+                        "total_credits": total_credits,
+                        "total_usage": total_usage,
+                    },
+                    status=200
+                )
+        
+        except httpx.TimeoutException:
+            logger.warning("OpenRouter API timeout")
+            return web.json_response(
+                {
+                    "credits_remaining": 0.0,
+                    "total_credits": 0.0,
+                    "total_usage": 0.0,
+                    "error": "OpenRouter API timeout",
+                },
+                status=200
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(f"OpenRouter balance fetch failed: {exc}")
+            return web.json_response(
+                {
+                    "credits_remaining": 0.0,
+                    "total_credits": 0.0,
+                    "total_usage": 0.0,
+                    "error": str(exc),
+                },
+                status=200
+            )
+
     def _get_existing_session_or_404(self, session_id: str) -> tuple[Optional[Dict[str, Any]], Optional["web.Response"]]:
         db = self._ensure_session_db()
         if db is None:
@@ -5451,6 +5553,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/auxiliary/medical-assist", self._handle_medical_assist)
             self._app.router.add_post("/api/auxiliary/journal-reflect", self._handle_journal_reflect)
             self._app.router.add_post("/api/auxiliary/research-reasoning", self._handle_research_reasoning)
+            self._app.router.add_get("/api/auxiliary/openrouter/balance", self._handle_openrouter_balance)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
