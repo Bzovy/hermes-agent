@@ -58,7 +58,7 @@ from gateway.platforms.base import (
     SendResult,
     is_network_accessible,
 )
-from gateway.platforms import investments_handler
+from gateway.platforms import investments_handler, analyst_desk_handler
 
 logger = logging.getLogger(__name__)
 
@@ -5570,6 +5570,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_post("/api/investments/quotes", investments_handler.handle_quotes)
             self._app.router.add_get("/api/investments/portfolio-aggregation", investments_handler.handle_portfolio_aggregation)
             self._app.router.add_get("/api/investments/networth-summary", investments_handler.handle_networth_summary)
+            self._app.router.add_post("/api/investments/analyst-desk/{ticker}", analyst_desk_handler.handle_analyst_desk)
             # Session/client control surface (thin wrappers over SessionDB + _run_agent)
             self._app.router.add_get("/api/sessions", self._handle_list_sessions)
             self._app.router.add_post("/api/sessions", self._handle_create_session)
