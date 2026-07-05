@@ -70,7 +70,9 @@ def _openrouter_client():
 
     api_key = os.environ.get("OPENROUTER_API_KEY")
     if not api_key:
+        logger.error("analyst_desk: OPENROUTER_API_KEY is not set")
         raise RuntimeError("OPENROUTER_API_KEY is not set")
+    logger.debug("analyst_desk: OPENROUTER_API_KEY is set (length=%d)", len(api_key))
     return AsyncOpenAI(
         base_url=_OPENROUTER_BASE_URL,
         api_key=api_key,
@@ -90,6 +92,7 @@ async def _openrouter_chat(
     """Call OpenRouter, return the response text content."""
     try:
         client = _openrouter_client()
+        logger.debug("analyst_desk: calling OpenRouter with model=%s", _OPENROUTER_MODEL)
         resp = await client.chat.completions.create(
             model=_OPENROUTER_MODEL,
             messages=messages,
@@ -100,7 +103,7 @@ async def _openrouter_chat(
         return resp.choices[0].message.content or ""
     except Exception as e:
         # OpenRouter account may be restricted (403 Forbidden). Fall back to deterministic analysis.
-        logger.info("analyst_desk: OpenRouter call failed (%s), falling back to rule-based analysis", type(e).__name__)
+        logger.error("analyst_desk: OpenRouter call failed (%s): %s", type(e).__name__, str(e))
         # Try to extract ticker context from user message for rule-based fallback
         raise  # Re-raise so caller can implement persona-specific fallback
 
