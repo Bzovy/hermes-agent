@@ -61,7 +61,11 @@ def _cache_set(ticker: str, result: Dict[str, Any]) -> None:
 # ── OpenRouter client ─────────────────────────────────────────────────────────
 
 _OPENROUTER_BASE_URL = "https://openrouter.io/api/v1"
-_OPENROUTER_MODEL = "anthropic/claude-haiku-4.5"  # Switched from deepseek-chat (403 errors)
+_OPENROUTER_MODEL = "anthropic/claude-3.5-haiku"  # Fast, cheap, reliable (~$0.04/req)
+
+# Use local gateway instead of external OpenRouter
+_USE_LOCAL_GATEWAY = True
+_LOCAL_GATEWAY_URL = "http://localhost:8642"
 
 
 def _openrouter_client():
@@ -89,23 +93,14 @@ async def _openrouter_chat(
     max_tokens: int = 500,
     timeout: float = 60,
 ) -> str:
-    """Call OpenRouter, return the response text content."""
-    try:
-        client = _openrouter_client()
-        logger.debug("analyst_desk: calling OpenRouter with model=%s", _OPENROUTER_MODEL)
-        resp = await client.chat.completions.create(
-            model=_OPENROUTER_MODEL,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            timeout=timeout,
-        )
-        return resp.choices[0].message.content or ""
-    except Exception as e:
-        # OpenRouter account may be restricted (403 Forbidden). Fall back to deterministic analysis.
-        logger.error("analyst_desk: OpenRouter call failed (%s): %s", type(e).__name__, str(e))
-        # Try to extract ticker context from user message for rule-based fallback
-        raise  # Re-raise so caller can implement persona-specific fallback
+    """Call OpenRouter, return the response text content.
+    
+    NOTE (2026-07-05): OpenRouter API (/api/v1) returns 404 on all requests,
+    indicating account restriction, API URL change, or service outage.
+    Falling back to rule-based analysis for now.
+    TODO: Wire to a working LLM provider (e.g., hermes gateway's own model).
+    """
+    raise RuntimeError("OpenRouter API unavailable; using rule-based analysis fallback")
 
 
 # ── Persona definitions ────────────────────────────────────────────────────────
