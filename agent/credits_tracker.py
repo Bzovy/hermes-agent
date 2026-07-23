@@ -286,6 +286,16 @@ def evaluate_credits_notices(
         for band in CREDITS_USAGE_BANDS:  # ascending → last match wins = highest
             if uf >= band[0]:
                 current_band = band
+    # Top-up suppression: when the account holds purchased (top-up) credits,
+    # the subscription-cap gauge is the wrong denominator — warning "90% used"
+    # at a user sitting on $50 of top-up is noise (and it previously stuck
+    # PERMANENTLY alongside grant_spent at >=100%). Suppress the usage band
+    # entirely; the cap-reached case is covered by the grant_spent info notice
+    # below, which already names the remaining top-up balance. A top-up landing
+    # mid-session flips current_band → None and the clear path below removes
+    # any showing band line.
+    if state.purchased_micros > 0:
+        current_band = None
     grant_cond = (
         state.denominator_kind == "subscription_cap"
         and uf is not None
@@ -306,12 +316,21 @@ def evaluate_credits_notices(
             active.discard(CREDITS_USAGE_KEY)
         if target_band is not None:
             # Belt-and-suspenders: a producer could set subscription_limit_micros
-            # without subscription_limit_usd. Render "$? cap" rather than "$None cap".
+            # without subscription_limit_usd. Render "$?" rather than "$None".
             _cap_usd = state.subscription_limit_usd or "?"
             _level = current_band[1]  # type: ignore[index]  (current_band set when target_band set)
+            # Report absolute dollars used, not a bare "N% used": the percentage is
+            # only meaningful against a Nous subscription cap (no cap → never fires),
+            # so dollars are clearer and don't imply a universal %. Used = cap −
+            # remaining (micros, money-safe), clamped to [0, cap]. Re-emits on band
+            # change (50 → 75 → 90), not every turn — a snapshot, not a live ticker.
+            _lim = state.subscription_limit_micros or 0
+            _used_micros = max(0, min(_lim, _lim - state.subscription_micros))
+            _used_usd = f"{_used_micros / 1_000_000:.2f}" if _lim else "?"
+            _glyph = "⚠" if _level == "warn" else "•"
             to_show.append(
                 AgentNotice(
-                    text=f"{'⚠' if _level == 'warn' else '•'} Credits {target_band}% used · ${_cap_usd} cap",
+                    text=f"{_glyph} You've used ${_used_usd} of your ${_cap_usd} cap",
                     level=_level,
                     kind=CREDITS_NOTICE_KIND,
                     key=CREDITS_USAGE_KEY,
@@ -345,7 +364,7 @@ def evaluate_credits_notices(
     if show_depleted and "credits.depleted" not in active:
         to_show.append(
             AgentNotice(
-                text="✕ Credit access paused · run /usage for balance",
+                text="✕ Credit access paused · run /topup to top up",
                 level="error",
                 kind=CREDITS_NOTICE_KIND,
                 key="credits.depleted",
